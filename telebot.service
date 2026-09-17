@@ -1,0 +1,17 @@
+[Unit]
+Description=Tele Shop Telegram Bot (VPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ⚠️ Sửa đường dẫn theo nơi bạn đặt code trên VPS
+WorkingDirectory=/opt/telebot
+ExecStart=/opt/telebot/venv/bin/python /opt/telebot/bot_vps.py
+Restart=always
+RestartSec=3
+# Chạy bằng user thường, không cần root
+User=devroom
+
+[Install]
+WantedBy=multi-user.target

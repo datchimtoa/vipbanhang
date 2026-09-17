@@ -1,0 +1,17 @@
+# secrets — KHÔNG push lên GitHub
+.env
+
+# runtime / database
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+tele_shop_vps.sqlite3*
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# logs
+*.log
