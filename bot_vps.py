@@ -16,6 +16,9 @@ TELE SHOP BOT — VPS EDITION v2 (Reply Keyboard)
 Chạy: python3 bot_vps.py
 """
 
+# Tương thích Python 3.9 (cú pháp X | Y trong type hints)
+from __future__ import annotations
+
 import html
 import logging
 import os
