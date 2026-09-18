@@ -11,7 +11,11 @@ TELE SHOP BOT — VPS EDITION v2 (Reply Keyboard)
 - Mua Acc Telegram: chọn "🎟 Mua gói acc" (10/20/50/100...) hoặc "📱 Mua acc lẻ".
 - Nạp tiền: 🏦 Bank (VietQR) / 💵 USDT (BEP20) / 💎 Gram (TON) -> user bấm
   "✅ Tôi đã chuyển tiền" -> bot gửi yêu cầu vào chat ADMIN để duyệt.
-- Sau khi mua, bot thông báo liên hệ @admin để nhận mã OTP.
+- Sau khi mua acc: bot hiện nút "🔑 Nhận OTP" dưới mỗi acc.
+  User bấm nút (hoặc /layotp <sdt>) -> bot gửi yêu cầu OTP tới admin kèm
+  @username người mua + ID Telegram + SĐT acc mua.
+  Admin chỉ cần REPLY tin nhắn yêu cầu bằng mã OTP (hoặc /guiotp <id> <ma>)
+  -> bot tự động gửi mã OTP cho khách.
 
 Chạy: python3 bot_vps.py
 """
