@@ -517,6 +517,23 @@ def get_open_otp_request(user_id: int, phone: str):
         return row
 
 
+def get_latest_pending_by_user(user_id: int):
+    """Yêu cầu OTP đang chờ mới nhất của 1 user.
+
+    Dùng khi admin gửi /guiotp với ID Telegram của khách
+    thay vì ID yêu cầu -> bot tự tìm yêu cầu mới nhất, không báo lỗi.
+    """
+    with _DB_LOCK:
+        con = db()
+        row = con.execute(
+            "SELECT * FROM otp_requests WHERE user_id=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        con.close()
+        return row
+
+
 def create_otp_request(user_id: int, phone: str, order_id: int | None) -> int:
     with _DB_LOCK:
         con = db()
@@ -1749,15 +1766,23 @@ async def cmd_guiotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👉 Hoặc chỉ cần <b>reply</b> tin nhắn yêu cầu OTP bằng mã OTP."
         )
         return
-    rid = int(context.args[0])
+    key = int(context.args[0])
     otp = _extract_otp(" ".join(context.args[1:]))
-    req = get_otp_request(rid)
+    req = get_otp_request(key)
     if not req:
-        await update.effective_message.reply_text(f"❌ Không tìm thấy yêu cầu OTP #{rid}.")
-        return
+        # Admin hay nhầm: gửi ID Telegram của khách thay vì ID yêu cầu.
+        # Tự tìm yêu cầu đang chờ mới nhất của user đó.
+        req = get_latest_pending_by_user(key)
+        if not req:
+            await update.effective_message.reply_text(
+                f"❌ Không tìm thấy yêu cầu OTP #{key}.\n"
+                f"👉 Xem danh sách đang chờ: /otplist"
+            )
+            return
+        log.info("Admin gửi /guiotp với user_id=%s -> tự tìm yêu cầu mới nhất #%s", key, req["id"])
     if req["status"] != "pending":
         await update.effective_message.reply_html(
-            f"⚠️ Yêu cầu #{rid} đã xử lý trước đó"
+            f"⚠️ Yêu cầu #{req['id']} đã xử lý trước đó"
             + (f" (mã: <code>{h(req['otp'])}</code>)" if req["otp"] else "") + "."
         )
         return
