@@ -6,7 +6,7 @@ TELE SHOP BOT — VPS EDITION v2 (Reply Keyboard)
 - Toàn bộ chức năng thao tác bằng NÚT TRÊN BÀN PHÍM (Reply Keyboard),
   không dùng nút inline dưới chat.
 - Menu chính: 📦 Chuyên mục | 📱 Mua Acc Telegram | 💳 Nạp tiền |
-  🧾 Lịch sử mua | �� Tiếp thị | 💰 Số dư | 🛠 Admin Panel (admin)
+  🧾 Lịch sử mua | 🤝 Tiếp thị | 💰 Số dư | 🛠 Admin Panel (admin)
 - Nội dung chuyển khoản: "Napid <idtelegram>" của user (giống bản gốc).
 - Mua Acc Telegram: chọn "🎟 Mua gói acc" (10/20/50/100...) hoặc "📱 Mua acc lẻ".
 - Nạp tiền: 🏦 Bank (VietQR) / 💵 USDT (BEP20) / 💎 Gram (TON) -> user bấm
@@ -30,6 +30,8 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -40,6 +42,7 @@ from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -177,6 +180,24 @@ def init_db() -> None:
                 price REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS otp_requests(
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                phone      TEXT NOT NULL,
+                order_id   INTEGER,
+                status     TEXT NOT NULL DEFAULT 'pending', -- pending|sent
+                otp        TEXT,
+                created_at TEXT,
+                sent_at    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_otp_status ON otp_requests(status);
+            CREATE TABLE IF NOT EXISTS otp_msg_map(
+                admin_id   INTEGER NOT NULL,
+                msg_id     INTEGER NOT NULL,
+                req_id     INTEGER NOT NULL,
+                created_at TEXT,
+                PRIMARY KEY(admin_id, msg_id)
+            );
             """
         )
         for size in PACK_SIZES:
@@ -465,6 +486,112 @@ def recent_orders(user_id: int, limit: int = 10) -> list:
 
 
 # ─────────────────────────────────────────────
+# OTP — user ấn nút xin OTP, admin gửi OTP, bot chuyển cho khách
+# ─────────────────────────────────────────────
+def user_owns_phone(user_id: int, phone: str) -> bool:
+    """Acc này có thuộc user không (đã mua)."""
+    with _DB_LOCK:
+        con = db()
+        row = con.execute(
+            "SELECT 1 FROM sll_accs WHERE phone=? AND status='sold' AND sold_to=?",
+            (phone, user_id),
+        ).fetchone()
+        con.close()
+        return row is not None
+
+
+def get_open_otp_request(user_id: int, phone: str):
+    """Yêu cầu OTP đang chờ xử lý (tránh user spam)."""
+    with _DB_LOCK:
+        con = db()
+        row = con.execute(
+            "SELECT * FROM otp_requests WHERE user_id=? AND phone=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id, phone),
+        ).fetchone()
+        con.close()
+        return row
+
+
+def create_otp_request(user_id: int, phone: str, order_id: int | None) -> int:
+    with _DB_LOCK:
+        con = db()
+        cur = con.execute(
+            "INSERT INTO otp_requests(user_id, phone, order_id, status, created_at) "
+            "VALUES(?,?,?,?,?)",
+            (user_id, phone, order_id, "pending", now_str()),
+        )
+        rid = int(cur.lastrowid)
+        con.close()
+    return rid
+
+
+def get_otp_request(rid: int):
+    with _DB_LOCK:
+        con = db()
+        row = con.execute("SELECT * FROM otp_requests WHERE id=?", (rid,)).fetchone()
+        con.close()
+        return row
+
+
+def map_otp_msg(admin_id: int, msg_id: int, req_id: int) -> None:
+    with _DB_LOCK:
+        con = db()
+        con.execute(
+            "INSERT INTO otp_msg_map(admin_id, msg_id, req_id, created_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(admin_id, msg_id) DO UPDATE SET req_id=excluded.req_id",
+            (admin_id, msg_id, req_id, now_str()),
+        )
+        con.close()
+
+
+def lookup_otp_msg(admin_id: int, msg_id: int):
+    """Tìm yêu cầu OTP từ tin nhắn admin đang reply."""
+    with _DB_LOCK:
+        con = db()
+        row = con.execute(
+            "SELECT r.* FROM otp_msg_map m JOIN otp_requests r ON r.id=m.req_id "
+            "WHERE m.admin_id=? AND m.msg_id=?",
+            (admin_id, msg_id),
+        ).fetchone()
+        con.close()
+        return row
+
+
+def fulfill_otp_request(rid: int, otp: str):
+    """Đánh dấu đã gửi OTP. Trả row nếu lần đầu (tránh gửi trùng)."""
+    with _DB_LOCK:
+        con = db()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT * FROM otp_requests WHERE id=? AND status='pending'", (rid,)
+            ).fetchone()
+            if not row:
+                con.execute("ROLLBACK")
+                return None
+            con.execute(
+                "UPDATE otp_requests SET status='sent', otp=?, sent_at=? WHERE id=?",
+                (otp, now_str(), rid),
+            )
+            con.execute("COMMIT")
+            return row
+        finally:
+            con.close()
+
+
+def pending_otp_requests(limit: int = 20) -> list:
+    with _DB_LOCK:
+        con = db()
+        rows = con.execute(
+            "SELECT * FROM otp_requests WHERE status='pending' ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        con.close()
+        return rows
+
+
+# ─────────────────────────────────────────────
 # NHÃN NÚT BÀN PHÍM (Reply Keyboard — giống bản gốc)
 # ─────────────────────────────────────────────
 BTN_CATS    = "📦 Chuyên mục"
@@ -492,7 +619,8 @@ LBL_DEP_NO  = "❌ Huỷ nạp"
 # Admin panel
 LBL_STOCK   = "📦 Kho acc"
 LBL_PENDING = "⏳ Nạp chờ duyệt"
-LBL_STATS   = "�� Thống kê"
+LBL_STATS   = "📊 Thống kê"
+LBL_OTP     = "🔑 OTP chờ gửi"
 
 METHOD_NAME = {
     "bank": "🏦 Ngân hàng (VietQR)",
@@ -575,7 +703,8 @@ def dep_confirm_kb() -> ReplyKeyboardMarkup:
 def admin_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton(LBL_STOCK), KeyboardButton(LBL_PENDING)],
-         [KeyboardButton(LBL_STATS), KeyboardButton(BTN_BACK)]],
+         [KeyboardButton(LBL_OTP), KeyboardButton(LBL_STATS)],
+         [KeyboardButton(BTN_BACK)]],
         **RP,
     )
 
@@ -847,11 +976,27 @@ async def flow_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💸 Đã trừ: {vnd(price)}\n"
         f"💰 Số dư còn lại: {vnd(get_balance(uid))}\n\n"
         f"📞 <b>DANH SÁCH ACC:</b>\n{listing}\n\n"
-        f"🔑 <b>Quan trọng:</b> Khi đăng nhập cần mã OTP —\n"
-        f"👉 Liên hệ <b>@{ADMIN_USERNAME}</b> để nhận OTP (kèm mã đơn #{order_id})."
+        f"🔑 <b>Nhận mã OTP:</b> bấm nút <b>🔑 Nhận OTP</b> bên dưới "
+        f"→ bot sẽ gửi yêu cầu tới <b>@{ADMIN_USERNAME}</b> và gửi lại OTP cho bạn ngay."
     )
+    otp_rows = [
+        [InlineKeyboardButton(f"🔑 Nhận OTP — {p}", callback_data=f"otp:req:{order_id}:{p}")]
+        for p in phones[:15]
+    ]
+    if otp_rows:
+        if len(phones) > 15:
+            txt += (
+                "\n\n💡 Đơn có nhiều acc: dùng <code>/layotp &lt;so_dien_thoai&gt;</code> "
+                "để lấy OTP cho từng acc."
+            )
+        await update.effective_message.reply_html(
+            txt, reply_markup=InlineKeyboardMarkup(otp_rows), disable_web_page_preview=True
+        )
+    else:
+        await update.effective_message.reply_html(txt, disable_web_page_preview=True)
+    # Trả lại bàn phím menu chính
     await update.effective_message.reply_html(
-        txt, reply_markup=main_kb(uid), disable_web_page_preview=True
+        "🏠 <b>Menu chính</b>", reply_markup=main_kb(uid)
     )
     # Thông báo hoa hồng cho người giới thiệu
     if referrer and bonus > 0:
@@ -981,7 +1126,7 @@ async def flow_deposit_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     dep = get_deposit(did) if did else None
     if not dep or dep["user_id"] != uid or dep["status"] != "draft":
         await update.effective_message.reply_text(
-            "❌ Không có yêu cầu nạp nào đang chờ. Tạo lại bằng �� Nạp tiền.",
+            "❌ Không có yêu cầu nạp nào đang chờ. Tạo lại bằng 💳 Nạp tiền.",
             reply_markup=main_kb(uid),
         )
         clear_state(context)
@@ -1019,7 +1164,7 @@ async def notify_admin_deposit(context: ContextTypes.DEFAULT_TYPE, did: int):
     txt = (
         f"🔔 <b>YÊU CẦU NẠP TIỀN #{dep['id']}</b>\n\n"
         f"👤 User: {dep['user_id']} (@{h(get_username(dep['user_id']))})\n"
-        f"�� Kênh: {METHOD_NAME.get(dep['method'], dep['method'])}\n"
+        f"💳 Kênh: {METHOD_NAME.get(dep['method'], dep['method'])}\n"
         f"💸 Số tiền: <b>{vnd(dep['amount'])}</b>{unit}\n"
         f"📝 Nội dung: <code>{h(dep['code'])}</code>\n"
         f"🕐 {dep['created_at']}\n\n"
@@ -1044,6 +1189,154 @@ def get_username(user_id: int) -> str:
         return (row["username"] if row and row["username"] else "") or ""
 
 
+def get_full_name(user_id: int) -> str:
+    with _DB_LOCK:
+        con = db()
+        row = con.execute(
+            "SELECT full_name FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        con.close()
+        return (row["full_name"] if row and row["full_name"] else "") or ""
+
+
+# ─────────────────────────────────────────────
+# LUỒNG OTP: user xin OTP -> admin reply mã -> bot gửi cho khách
+# ─────────────────────────────────────────────
+async def notify_admin_otp(bot, rid: int):
+    """Gửi yêu cầu OTP tới tất cả admin (kèm @nguoimua, ID Telegram, SĐT acc)."""
+    req = get_otp_request(rid)
+    if not req:
+        return
+    uname = get_username(req["user_id"])
+    full = get_full_name(req["user_id"])
+    buyer = f"@{h(uname)}" if uname else "Không có username"
+    txt = (
+        f"🔑 <b>YÊU CẦU OTP #{rid}</b>\n\n"
+        f"👤 Người mua: <b>{buyer}</b> — <a href=\"tg://user?id={req['user_id']}\">{h(full or 'user')}</a>\n"
+        f"🆔 ID Telegram: <code>{req['user_id']}</code>\n"
+        f"📞 SĐT acc mua: <code>{h(req['phone'])}</code>\n"
+        f"🧾 Đơn hàng: <b>#{req['order_id']}</b>\n"
+        f"🕐 {req['created_at']}\n\n"
+        "👉 <b>Reply (trả lời) chính tin nhắn này bằng mã OTP</b> — bot sẽ tự gửi cho khách.\n"
+        f"Hoặc dùng: <code>/guiotp {rid} &lt;ma_otp&gt;</code>"
+    )
+    for aid in ADMIN_IDS:
+        try:
+            m = await bot.send_message(aid, txt, parse_mode=ParseMode.HTML)
+            if m:
+                map_otp_msg(aid, m.message_id, rid)
+        except TelegramError as e:
+            log.warning("Không gửi được yêu cầu OTP cho admin %s: %s", aid, e)
+
+
+async def flow_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE, phone: str):
+    """User (hoặc callback) yêu cầu OTP cho 1 SĐT đã mua."""
+    uid = update.effective_user.id
+    phone = (phone or "").strip().lstrip("+")
+    if not re.fullmatch(r"\d{8,15}", phone):
+        await update.effective_message.reply_html(
+            "❌ SĐT không hợp lệ. Dùng: <code>/layotp 0912345678</code>"
+        )
+        return
+    if not user_owns_phone(uid, phone):
+        await update.effective_message.reply_html(
+            "❌ Bạn chưa mua acc có SĐT này. Kiểm tra lại trong 🧾 Lịch sử mua."
+        )
+        return
+    open_req = get_open_otp_request(uid, phone)
+    if open_req:
+        await update.effective_message.reply_html(
+            f"⏳ Bạn đã gửi yêu cầu OTP cho acc <code>{h(phone)}</code> (yêu cầu #{open_req['id']}).\n"
+            f"Vui lòng chờ <b>@{ADMIN_USERNAME}</b> gửi mã — bot sẽ gửi lại ngay khi có."
+        )
+        return
+    rid = create_otp_request(uid, phone, None)
+    await update.effective_message.reply_html(
+        f"✅ <b>Đã gửi yêu cầu OTP #{rid}</b> cho acc <code>{h(phone)}</code>.\n"
+        f"⏳ Chờ <b>@{ADMIN_USERNAME}</b> gửi mã — bot sẽ tự động gửi lại cho bạn."
+    )
+    await notify_admin_otp(context.bot, rid)
+
+
+async def deliver_otp_to_client(context: ContextTypes.DEFAULT_TYPE, req, otp: str):
+    """Gửi OTP cho khách. Trả True nếu gửi thành công lần đầu."""
+    done = fulfill_otp_request(req["id"], otp)
+    if not done:
+        return False
+    ok = True
+    try:
+        await context.bot.send_message(
+            req["user_id"],
+            f"🔑 <b>MÃ OTP CHO ACC</b> <code>{h(req['phone'])}</code>\n\n"
+            f"<code>{h(otp)}</code>\n\n"
+            "⏳ Mã có hiệu lực ngắn — nhập ngay để đăng nhập nhé!",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        ok = False
+        log.warning("Không gửi được OTP cho user %s: %s", req["user_id"], e)
+    return ok
+
+
+def _extract_otp(text: str) -> str:
+    """Đọc mã OTP từ tin nhắn admin (vd '123456' hoặc 'ma otp la 123456')."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9\-]{3,16}", t):
+        return t
+    tokens = re.findall(r"[A-Za-z0-9\-]{3,16}", t)
+    for tok in reversed(tokens):        # ưu tiên token toàn số
+        if tok.isdigit():
+            return tok
+    return tokens[-1] if tokens else t[:16]
+
+
+async def cb_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User bấm nút  Nhận OTP dưới tin nhắn mua thành công."""
+    q = update.callback_query
+    uid = q.from_user.id
+    parts = q.data.split(":")          # otp:req:<order_id>:<phone>
+    try:
+        order_id = int(parts[2])
+        phone = parts[3]
+    except (IndexError, ValueError):
+        await q.answer("❌ Yêu cầu không hợp lệ.", show_alert=True)
+        return
+    if not user_owns_phone(uid, phone):
+        await q.answer("❌ Acc này không thuộc bạn.", show_alert=True)
+        return
+    open_req = get_open_otp_request(uid, phone)
+    if open_req:
+        await q.answer(
+            f"⏳ Đã gửi yêu cầu OTP #{open_req['id']} — chờ admin gửi mã nhé!",
+            show_alert=True,
+        )
+        return
+    rid = create_otp_request(uid, phone, order_id)
+    await q.answer("✅ Đã gửi yêu cầu OTP tới admin!", show_alert=True)
+    await notify_admin_otp(context.bot, rid)
+    try:
+        await q.message.reply_html(
+            f"🔑 <b>YÊU CẦU OTP #{rid}</b>\n"
+            f"📞 Acc: <code>{h(phone)}</code>\n"
+            f"✅ Đã gửi tới <b>@{ADMIN_USERNAME}</b> — bot sẽ tự động gửi mã OTP cho bạn ngay khi admin phản hồi."
+        )
+    except TelegramError:
+        pass
+
+
+async def cmd_layotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/layotp <sdt> — user yêu cầu OTP cho acc đã mua."""
+    if not context.args:
+        await update.effective_message.reply_html(
+            "📝 Dùng: <code>/layotp 0912345678</code>\n"
+            "hoặc bấm nút <b>🔑 Nhận OTP</b> dưới tin nhắn mua thành công."
+        )
+        return
+    await flow_otp_request(update, context, context.args[0])
+
+
 # ─────────────────────────────────────────────
 # ADMIN PANEL (bàn phím)
 # ─────────────────────────────────────────────
@@ -1059,6 +1352,9 @@ async def flow_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/addsll</code> — thêm SĐT (xuống dòng/cách/phẩy)\n"
         "• <code>/delsll &lt;sdt&gt;</code> — xoá acc\n"
         "• <code>/duyet &lt;id&gt;</code> / <code>/tuchoi &lt;id&gt;</code> — duyệt nạp\n"
+        "• <code>/otplist</code> — YC OTP đang chờ (hoặc nút 🔑 OTP chờ gửi)\n"
+        "• <code>/guiotp &lt;id&gt; &lt;ma&gt;</code> — gửi OTP cho khách\n"
+        "   (hoặc chỉ cần <b>reply</b> tin nhắn YC OTP bằng mã OTP)\n"
         "• <code>/setpack &lt;size&gt; &lt;giá&gt;</code> — giá gói\n"
         "• <code>/setprice &lt;giá&gt;</code> — giá acc lẻ\n"
         "• <code>/setrate &lt;usdt|ton&gt; &lt;vnd&gt;</code> — tỉ giá\n"
@@ -1289,6 +1585,60 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await flow_admin_stats(update, context)
 
 
+@admin_only
+async def cmd_guiotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/guiotp <id_yeu_cau> <ma_otp> — admin gửi OTP cho khách."""
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.effective_message.reply_html(
+            "📝 Dùng: <code>/guiotp &lt;id_yeu_cau&gt; &lt;ma_otp&gt;</code>\n"
+            "vd: <code>/guiotp 12 123456</code>\n"
+            "👉 Hoặc chỉ cần <b>reply</b> tin nhắn yêu cầu OTP bằng mã OTP."
+        )
+        return
+    rid = int(context.args[0])
+    otp = _extract_otp(" ".join(context.args[1:]))
+    req = get_otp_request(rid)
+    if not req:
+        await update.effective_message.reply_text(f"❌ Không tìm thấy yêu cầu OTP #{rid}.")
+        return
+    if req["status"] != "pending":
+        await update.effective_message.reply_html(
+            f"⚠️ Yêu cầu #{rid} đã xử lý trước đó"
+            + (f" (mã: <code>{h(req['otp'])}</code>)" if req["otp"] else "") + "."
+        )
+        return
+    ok = await deliver_otp_to_client(context, req, otp)
+    if ok:
+        await update.effective_message.reply_html(
+            f"✅ Đã gửi OTP cho khách <b>@{h(get_username(req['user_id']))}</b> "
+            f"(user {req['user_id']}, acc <code>{h(req['phone'])}</code>)."
+        )
+    else:
+        await update.effective_message.reply_html(
+            f"⚠️ Không gửi được cho user {req['user_id']} (có thể đã chặn bot)."
+        )
+
+
+@admin_only
+async def cmd_otplist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/otplist — danh sách yêu cầu OTP đang chờ."""
+    rows = pending_otp_requests()
+    if not rows:
+        await update.effective_message.reply_text("✅ Không có yêu cầu OTP nào đang chờ.")
+        return
+    lines = []
+    for r in rows:
+        uname = get_username(r["user_id"]) or "no_username"
+        lines.append(
+            f"#{r['id']} — @{h(uname)} (id {r['user_id']}) — "
+            f"acc <code>{h(r['phone'])}</code> — đơn #{r['order_id']} — {r['created_at']}"
+        )
+    await update.effective_message.reply_html(
+        "🔑 <b>YÊU CẦU OTP ĐANG CHỜ</b>\n\n" + "\n".join(lines)
+        + "\n\n👉 Gửi mã: <code>/guiotp &lt;id&gt; &lt;ma_otp&gt;</code>"
+    )
+
+
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_html(
         f"🆔 ID của bạn: <code>{update.effective_user.id}</code>\n"
@@ -1304,6 +1654,32 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = (msg.text or "").strip()
     ensure_user(uid, update.effective_user.username, update.effective_user.full_name)
+
+    # ── 0) ADMIN REPLY tin nhắn yêu cầu OTP = gửi OTP cho khách ──
+    if is_admin(uid) and msg.reply_to_message:
+        req = lookup_otp_msg(uid, msg.reply_to_message.message_id)
+        if req:
+            if req["status"] != "pending":
+                await msg.reply_html(
+                    f"⚠️ Yêu cầu OTP #{req['id']} đã được gửi trước đó rồi."
+                )
+                return
+            code = _extract_otp(text)
+            if not code:
+                await msg.reply_text("❌ Không đọc được mã OTP. Reply lại với mã (vd: 123456).")
+                return
+            ok = await deliver_otp_to_client(context, req, code)
+            if ok:
+                await msg.reply_html(
+                    f"✅ Đã gửi OTP <code>{h(code)}</code> cho khách "
+                    f"<b>@{h(get_username(req['user_id']))}</b> "
+                    f"(user {req['user_id']}, acc <code>{h(req['phone'])}</code>)."
+                )
+            else:
+                await msg.reply_html(
+                    f"⚠️ Không gửi được cho user {req['user_id']} (có thể đã chặn bot)."
+                )
+            return
 
     # ── 1) Nút menu chính — luôn ưu tiên (để user luôn thoát được luồng) ──
     if text == BTN_BACK:
@@ -1407,6 +1783,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == LBL_STATS:
             await flow_admin_stats(update, context)
             return
+        if text == LBL_OTP:
+            await cmd_otplist(update, context)
+            return
 
     # ── 5) Fallback ──
     await msg.reply_html(
@@ -1455,6 +1834,14 @@ def main() -> None:
     app.add_handler(CommandHandler("setaff", cmd_setaff), group=0)
     app.add_handler(CommandHandler("addbal", cmd_addbal), group=0)
     app.add_handler(CommandHandler("stats", cmd_stats), group=0)
+    app.add_handler(CommandHandler("layotp", cmd_layotp), group=0)
+    app.add_handler(CommandHandler("guiotp", cmd_guiotp), group=0)
+    app.add_handler(CommandHandler("otplist", cmd_otplist), group=0)
+
+    # Callback: user bấm nút 🔑 Nhận OTP dưới tin nhắn mua thành công
+    app.add_handler(
+        CallbackQueryHandler(cb_otp_request, pattern=r"^otp:req:\d+:\d+$"), group=0
+    )
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message), group=1)
     app.add_error_handler(on_error)

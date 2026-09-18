@@ -69,7 +69,17 @@ systemctl restart telebot
 1. Bấm `📱 Mua Acc Telegram` → bot hỏi **mua gói hay mua lẻ**:
    - `🎟 Mua gói acc` → chọn gói 10/20/50/100... trên bàn phím → `✅ Xác nhận mua`
    - `📱 Mua acc lẻ` → 1 acc, giá do `/setprice` đặt
-2. Nhận danh sách SĐT + hướng dẫn **liên hệ @admin để nhận mã OTP**.
+2. Nhận danh sách SĐT + **nút `🔑 Nhận OTP`** bên dưới (mỗi acc 1 nút).
+
+### 🔑 Nhận OTP (user ↔ admin)
+1. User bấm nút `🔑 Nhận OTP — <sđt>` dưới tin nhắn mua thành công
+   (hoặc gõ `/layotp <sđt>` nếu đơn nhiều acc).
+2. Bot gửi **yêu cầu OTP** vào chat admin, kèm:
+   - 👤 `@username` người mua + tên + 🆔 ID Telegram
+   - 📞 SĐT acc đã mua + 🧾 mã đơn
+3. Admin **chỉ cần reply (trả lời) chính tin nhắn yêu cầu đó bằng mã OTP**
+   (hoặc dùng `/guiotp <id> <mã>`) → bot **tự động gửi OTP cho khách** ngay.
+4. Bot chống spam/trùng: 1 acc chỉ có 1 yêu cầu chờ; mã không gửi 2 lần.
 
 ### 💳 Nạp tiền
 1. Bấm `💳 Nạp tiền` → chọn kênh trên bàn phím: `🏦 Ngân hàng (VietQR)` / `💵 USDT (BEP20)` / `💎 Gram (TON)`
@@ -80,6 +90,14 @@ systemctl restart telebot
 ### 🤝 Tiếp thị
 Mỗi user có link `https://t.me/<bot>?start=ref<id>` — người được giới thiệu mua hàng thì người giới thiệu nhận % hoa hồng (mặc định 5%, đổi bằng `/setaff`).
 
+### 📋 Lệnh dành cho user
+| Lệnh | Chức năng |
+|---|---|
+| `/start` | Mở menu chính (kèm bàn phím) |
+| `/id` | Xem ID Telegram + nội dung nạp `Napid <id>` |
+| `/layotp <sđt>` | Yêu cầu OTP cho acc đã mua (dùng cho đơn nhiều acc) |
+
+
 ### Admin (lệnh slash + nút `🛠 Admin Panel`)
 | Lệnh | Chức năng |
 |---|---|
@@ -88,6 +106,9 @@ Mỗi user có link `https://t.me/<bot>?start=ref<id>` — người được gi�
 | `/stock` hoặc nút `📦 Kho acc` | Xem kho |
 | `/pending` hoặc nút `⏳ Nạp chờ duyệt` | Danh sách nạp chờ duyệt |
 | `/duyet <id>` / `/tuchoi <id>` | Duyệt / từ chối nạp |
+| **Reply tin nhắn YC OTP bằng mã OTP** | Gửi OTP cho khách (cách nhanh nhất) |
+| `/otplist` hoặc nút `🔑 OTP chờ gửi` | Danh sách yêu cầu OTP đang chờ |
+| `/guiotp <id> <mã>` | Gửi OTP cho khách theo số yêu cầu |
 | `/setpack <size> <giá>` | Tạo/đổi giá gói |
 | `/setprice <giá>` | Đổi giá acc lẻ |
 | `/setrate <usdt\|ton> <vnd>` | Đổi tỉ giá USDT/TON |
