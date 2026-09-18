@@ -713,6 +713,20 @@ def admin_kb() -> ReplyKeyboardMarkup:
     )
 
 
+def _otp_reply_kb(phones: list) -> ReplyKeyboardMarkup:
+    """Bàn phím LẤY OTP dự phòng (fallback khi InlineKeyboard bị lỗi).
+
+    Mỗi nút mã hoá order_id + phone -> callback otp:req để admin gửi từng OTP,
+    bot trả lại từng mã theo đúng thứ tự kèm SĐT.
+    """
+    rows = [
+        [KeyboardButton(f"🔑 LẤY OTP {p}")]
+        for p in phones[:20]
+    ]
+    rows.append([KeyboardButton(BTN_BACK)])
+    return ReplyKeyboardMarkup(rows, **RP)
+
+
 def cats_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton(BTN_TELE), KeyboardButton(BTN_DEPOSIT)],
@@ -771,7 +785,7 @@ async def flow_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Xin chào <b>{h(u.full_name or u.first_name or 'bạn')}</b>!\n\n"
         "📱 Bot bán <b>Acc Telegram SLL</b> (mua gói hoặc acc lẻ).\n"
         "💳 Nạp: 🏦 Ngân hàng (VietQR) • 💵 USDT (BEP20) • 💎 Gram (TON)\n"
-        "🔑 Sau khi mua acc, liên hệ <b>@" + ADMIN_USERNAME + "</b> để nhận mã OTP.\n\n"
+        "🔑 Sau khi mua acc, lấy mã OTP ngay tại bot này (có nút lấy OTP dưới đơn).\n\n"
         "👇 Chọn chức năng trên bàn phím bên dưới:",
         reply_markup=main_kb(uid),
         disable_web_page_preview=True,
@@ -856,7 +870,7 @@ async def flow_buy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Kho hiện có: <b>{stock_count()}</b> acc\n"
         "🎟 Gói: " + ", ".join(str(s) for s, _ in get_packages()) + " acc\n"
         f"📱 Acc lẻ: {vnd(single_price())}/acc\n\n"
-        "🔑 Mua xong liên hệ <b>@" + ADMIN_USERNAME + "</b> để nhận mã OTP.\n\n"
+        "🔑 Mua xong lấy mã OTP ngay tại bot này (nút lấy OTP hiện dưới đơn).\n\n"
         "👇 Bạn muốn mua gói hay mua lẻ?",
         reply_markup=buy_kb(),
     )
@@ -980,24 +994,41 @@ async def flow_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💸 Đã trừ: {vnd(price)}\n"
         f"💰 Số dư còn lại: {vnd(get_balance(uid))}\n\n"
         f"📞 <b>DANH SÁCH ACC:</b>\n{listing}\n\n"
-        f"🔑 <b>Nhận mã OTP:</b> bấm nút <b>🔑 Nhận OTP</b> bên dưới "
-        f"→ bot sẽ gửi yêu cầu tới <b>@{ADMIN_USERNAME}</b> và gửi lại OTP cho bạn ngay."
+        f"🔑 <b>Nhận mã OTP:</b> lấy OTP ngay tại bot này — bấm nút "
+        f"<b>🔑 Nhận OTP</b> ở tin nhắn bên dưới, mã được gửi lại tự động khi có."
     )
     otp_rows = [
         [InlineKeyboardButton(f"🔑 Nhận OTP — {p}", callback_data=f"otp:req:{order_id}:{p}")]
-        for p in phones[:15]
+        for p in phones[:20]
     ]
-    if otp_rows:
-        if len(phones) > 15:
-            txt += (
-                "\n\n💡 Đơn có nhiều acc: dùng <code>/layotp &lt;so_dien_thoai&gt;</code> "
-                "để lấy OTP cho từng acc."
-            )
-        await update.effective_message.reply_html(
-            txt, reply_markup=InlineKeyboardMarkup(otp_rows), disable_web_page_preview=True
+    if len(phones) > 20:
+        txt += (
+            "\n\n💡 Đơn có nhiều hơn 20 acc: dùng <code>/layotpsll &lt;sdt1&gt; &lt;sdt2&gt; ...</code> "
+            "(cách nhau bằng dấu cách, tối đa 10 SĐT/lần) để lấy OTP cho từng acc."
         )
-    else:
-        await update.effective_message.reply_html(txt, disable_web_page_preview=True)
+    await update.effective_message.reply_html(txt, disable_web_page_preview=True)
+    # Gửi nút OTP ở tin nhắn riêng + try/except: đảm bảo nút hiện 100%
+    if otp_rows:
+        try:
+            btn_msg = await update.effective_message.reply_html(
+                "👇 <b>Bấm nút bên dưới để lấy OTP cho từng acc</b> "
+                "(bot gửi yêu cầu ngay, mã OTP được gửi lại tự động):",
+                reply_markup=InlineKeyboardMarkup(otp_rows),
+                disable_web_page_preview=True,
+            )
+            log.info(
+                "Đã gửi %d nút OTP cho user %s (đơn #%s, msg=%s)",
+                len(otp_rows), uid, order_id,
+                getattr(btn_msg, "message_id", "?"),
+            )
+        except TelegramError as e:
+            log.error("Không gửi được nút OTP inline cho user %s: %s — dùng fallback bàn phím", uid, e)
+            await update.effective_message.reply_html(
+                "👇 <b>Bấm nút LẤY OTP bên dưới</b> "
+                "(bot gửi yêu cầu ngay, mã OTP được gửi lại tự động):",
+                reply_markup=_otp_reply_kb(phones[:20]),
+                disable_web_page_preview=True,
+            )
     # Trả lại bàn phím menu chính
     await update.effective_message.reply_html(
         "🏠 <b>Menu chính</b>", reply_markup=main_kb(uid)
@@ -1206,19 +1237,29 @@ def get_full_name(user_id: int) -> str:
 # ─────────────────────────────────────────────
 # LUỒNG OTP: user xin OTP -> admin reply mã -> bot gửi cho khách
 # ─────────────────────────────────────────────
-async def notify_admin_otp(bot, rid: int):
-    """Gửi yêu cầu OTP tới tất cả admin (kèm @nguoimua, ID Telegram, SĐT acc)."""
+async def notify_admin_otp(bot, rid: int, requester=None):
+    """Gửi yêu cầu OTP tới tất cả admin (kèm @nguoimua, ID, SĐT acc).
+
+    - Nếu là mua 1 acc (bấm nút ngay sau khi mua): gửi đủ tham số
+      tên người mua (tên Telegram), ID Telegram, SĐT acc đã mua.
+    - Nếu là mua SLL (lệnh /layotpsll): mỗi SĐT là 1 yêu cầu riêng —
+      admin nhận từng cái lẻ (có SĐT trong tin nhắn), admin gửi từng OTP;
+      bot trả lại từng OTP theo đúng thứ tự, kèm SĐT của mã đó.
+    """
     req = get_otp_request(rid)
     if not req:
         return
     uname = get_username(req["user_id"])
     full = get_full_name(req["user_id"])
+    if requester is not None:
+        full = requester.full_name or full
+        uname = requester.username or uname
     buyer = f"@{h(uname)}" if uname else "Không có username"
     txt = (
         f"🔑 <b>YÊU CẦU OTP #{rid}</b>\n\n"
-        f"👤 Người mua: <b>{buyer}</b> — <a href=\"tg://user?id={req['user_id']}\">{h(full or 'user')}</a>\n"
+        f"👤 Tên người mua (tên Telegram): <b>{h(full or 'user')}</b> — {buyer}\n"
         f"🆔 ID Telegram: <code>{req['user_id']}</code>\n"
-        f"📞 SĐT acc mua: <code>{h(req['phone'])}</code>\n"
+        f"📞 SĐT acc đã mua: <code>{h(req['phone'])}</code>\n"
         f"🧾 Đơn hàng: <b>#{req['order_id']}</b>\n"
         f"🕐 {req['created_at']}\n\n"
         "👉 <b>Reply (trả lời) chính tin nhắn này bằng mã OTP</b> — bot sẽ tự gửi cho khách.\n"
@@ -1239,7 +1280,8 @@ async def flow_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE, p
     phone = (phone or "").strip().lstrip("+")
     if not re.fullmatch(r"\d{8,15}", phone):
         await update.effective_message.reply_html(
-            "❌ SĐT không hợp lệ. Dùng: <code>/layotp 0912345678</code>"
+            "❌ SĐT không hợp lệ. Dùng: <code>/layotp 0912345678</code>\n"
+            "Mua SLL nhiều acc: <code>/layotpsll 0912.. 0987.. ...</code>"
         )
         return
     if not user_owns_phone(uid, phone):
@@ -1259,7 +1301,74 @@ async def flow_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE, p
         f"✅ <b>Đã gửi yêu cầu OTP #{rid}</b> cho acc <code>{h(phone)}</code>.\n"
         f"⏳ Chờ <b>@{ADMIN_USERNAME}</b> gửi mã — bot sẽ tự động gửi lại cho bạn."
     )
-    await notify_admin_otp(context.bot, rid)
+    await notify_admin_otp(context.bot, rid, update.effective_user)
+
+
+async def cmd_layotpsll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/layotpsll <sdt1> <sdt2> ... — lấy OTP hàng loạt (tối đa 10 SĐT/lần).
+
+    Đúng định dạng yêu cầu: mỗi SĐT cách nhau 1 dấu cách, mỗi lần tối đa 10 số.
+    Admin nhận từng yêu cầu riêng, gửi SĐT vào chat admin;
+    bot trả lại từng OTP cho user theo đúng thứ tự kèm SĐT của mã đó.
+    """
+    msg = update.effective_message
+    uid = update.effective_user.id
+    args = list(context.args or [])
+    if not args:
+        await msg.reply_html(
+            "📝 <b>Cách dùng lấy OTP SLL:</b>\n"
+            "<code>/layotpsll 0912345678 0987654321 0933111222</code>\n"
+            "• Mỗi SĐT cách nhau 1 dấu cách, mỗi lần tối đa <b>10 SĐT</b>.\n"
+            "• Chỉ lấy được cho các acc <b>bạn đã mua</b>.\n"
+            "• Mua lẻ 1 acc: bấm nút <b>🔑 Nhận OTP</b> dưới đơn mua hoặc dùng <code>/layotp</code>."
+        )
+        return
+    parsed = parse_phones(" ".join(args))
+    if not parsed:
+        await msg.reply_html(
+            "❌ Không tìm thấy SĐT hợp lệ.\n"
+            "Ví dụ đúng: <code>/layotpsll 0912345678 0987654321</code>"
+        )
+        return
+    if len(parsed) > 10:
+        await msg.reply_html(
+            f"❌ Mỗi lần chỉ được tối đa <b>10 SĐT</b> (bạn gửi {len(parsed)} SĐT).\n"
+            f"👉 Chia nhỏ ra và gửi lại, ví dụ 10 số/lần."
+        )
+        return
+    ok_rids: list[tuple[int, str]] = []     # (req_id, phone) — giữ đúng thứ tự
+    skip_dup: list[str] = []
+    skip_own: list[str] = []
+    for p in parsed:
+        if not user_owns_phone(uid, p):
+            skip_own.append(p)
+            continue
+        if get_open_otp_request(uid, p):
+            skip_dup.append(p)
+            continue
+        rid = create_otp_request(uid, p, None)
+        ok_rids.append((rid, p))
+    if not ok_rids:
+        parts = ["⚠️ Không tạo được yêu cầu OTP nào."]
+        if skip_dup:
+            parts.append("• Đã gửi từ trước: " + ", ".join(f"<code>{h(x)}</code>" for x in skip_dup))
+        if skip_own:
+            parts.append("• Bạn chưa mua: " + ", ".join(f"<code>{h(x)}</code>" for x in skip_own))
+        await msg.reply_html("\n".join(parts))
+        return
+    lst = "\n".join(
+        f"{i}. <code>{h(p)}</code> (yêu cầu #{rid})" for i, (rid, p) in enumerate(ok_rids, 1)
+    )
+    await msg.reply_html(
+        f"✅ <b>Đã gửi {len(ok_rids)} yêu cầu OTP SLL:</b>\n{lst}\n"
+        f"⏳ Chờ <b>@{ADMIN_USERNAME}</b> gửi từng mã — "
+        f"bot sẽ trả lại từng OTP cho bạn theo đúng thứ tự kèm SĐT."
+        + (f"\n\n⚠️ Bỏ qua (đã gửi từ trước): " + ", ".join(f"<code>{h(x)}</code>" for x in skip_dup) if skip_dup else "")
+        + (f"\n⚠️ Bỏ qua (bạn chưa mua): " + ", ".join(f"<code>{h(x)}</code>" for x in skip_own) if skip_own else "")
+    )
+    # Gửi từng yêu cầu tới admin để admin gửi từng OTP
+    for rid, _p in ok_rids:
+        await notify_admin_otp(context.bot, rid, update.effective_user)
 
 
 async def deliver_otp_to_client(context: ContextTypes.DEFAULT_TYPE, req, otp: str):
@@ -1296,17 +1405,53 @@ def _extract_otp(text: str) -> str:
     return tokens[-1] if tokens else t[:16]
 
 
+async def cb_otp_by_phone(update: Update, context: ContextTypes.DEFAULT_TYPE, phone: str):
+    """Chung 1 đường cho nút INLINE (otp:req) và nút ReplyKeyboard (🔑 LẤY OTP).
+
+    Tạo yêu cầu OTP duy nhất, gửi notify đầy đủ tham số về admin.
+    """
+    uid = update.effective_user.id
+    phone = (phone or "").strip().lstrip("+")
+    if not user_owns_phone(uid, phone):
+        await update.effective_message.reply_html(
+            "❌ Acc này không thuộc bạn. Kiểm tra lại trong 🧾 Lịch sử mua."
+        )
+        return
+    open_req = get_open_otp_request(uid, phone)
+    if open_req:
+        await update.effective_message.reply_html(
+            f"⏳ Đã gửi yêu cầu OTP #{open_req['id']} cho acc <code>{h(phone)}</code> — chờ admin gửi mã nhé!"
+        )
+        return
+    order_id = None
+    with _DB_LOCK:
+        con = db()
+        row = con.execute(
+            "SELECT order_id FROM sll_accs WHERE phone=? AND sold_to=? ORDER BY order_id DESC LIMIT 1",
+            (phone, uid),
+        ).fetchone()
+        con.close()
+        if row:
+            order_id = row["order_id"]
+    rid = create_otp_request(uid, phone, order_id)
+    await update.effective_message.reply_html(
+        f"✅ <b>Đã gửi yêu cầu OTP #{rid}</b> cho acc <code>{h(phone)}</code> tới admin.\n"
+        f"⏳ Bot sẽ gửi lại mã OTP ngay khi admin phản hồi."
+    )
+    await notify_admin_otp(context.bot, rid, update.effective_user)
+
+
 async def cb_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User bấm nút  Nhận OTP dưới tin nhắn mua thành công."""
     q = update.callback_query
     uid = q.from_user.id
     parts = q.data.split(":")          # otp:req:<order_id>:<phone>
     try:
-        order_id = int(parts[2])
         phone = parts[3]
     except (IndexError, ValueError):
         await q.answer("❌ Yêu cầu không hợp lệ.", show_alert=True)
         return
+    phone = (phone or "").strip().lstrip("+")
     if not user_owns_phone(uid, phone):
         await q.answer("❌ Acc này không thuộc bạn.", show_alert=True)
         return
@@ -1317,9 +1462,14 @@ async def cb_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             show_alert=True,
         )
         return
+    order_id = None
+    try:
+        order_id = int(parts[2])
+    except (IndexError, ValueError):
+        pass
     rid = create_otp_request(uid, phone, order_id)
     await q.answer("✅ Đã gửi yêu cầu OTP tới admin!", show_alert=True)
-    await notify_admin_otp(context.bot, rid)
+    await notify_admin_otp(context.bot, rid, q.from_user)
     try:
         await q.message.reply_html(
             f"🔑 <b>YÊU CẦU OTP #{rid}</b>\n"
@@ -1685,6 +1835,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
+    # ── 0) Nút LẤY OTP dự phòng (ReplyKeyboard): mỗi nút = 1 SĐT đã mua ──
+    m_otp = re.fullmatch(r"🔑 LẤY OTP (\+?\d{8,15})", text)
+    if m_otp:
+        await cb_otp_by_phone(update, context, m_otp.group(1))
+        return
     # ── 1) Nút menu chính — luôn ưu tiên (để user luôn thoát được luồng) ──
     if text == BTN_BACK:
         clear_state(context)
@@ -1839,6 +1994,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addbal", cmd_addbal), group=0)
     app.add_handler(CommandHandler("stats", cmd_stats), group=0)
     app.add_handler(CommandHandler("layotp", cmd_layotp), group=0)
+    app.add_handler(CommandHandler("layotpsll", cmd_layotpsll), group=0)
     app.add_handler(CommandHandler("guiotp", cmd_guiotp), group=0)
     app.add_handler(CommandHandler("otplist", cmd_otplist), group=0)
 
