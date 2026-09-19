@@ -35,8 +35,10 @@ venv/bin/pip install -r requirements.txt
 Mở `/opt/telebot/.env`, điền:
 - `BOT_TOKEN` — từ @BotFather
 - `ADMIN_IDS` — ID Telegram của bạn (gõ `/id` cho bot hoặc dùng @userinfobot)
-- `ADMIN_USERNAME` — username admin (bot bảo user liên hệ để nhận OTP)
+- `ADMIN_USERNAME` — username admin (chỉ dùng khi bot báo lỗi/hết kho; **OTP lấy ngay tại bot**)
+- `ADMIN_IDS` — ID Telegram admin nhận yêu cầu nạp tiền + yêu cầu OTP
 - Thông tin ngân hàng / ví USDT BEP20 / ví TON (kênh nào để trống sẽ tự ẩn)
+- `SHOW_ACC_INFO=1` — gửi kèm MK/2FA cho khách (đổi runtime bằng `/setaccinfo`)
 
 ## 3. Chạy thử
 
@@ -84,7 +86,28 @@ systemctl restart telebot
    admin gửi từng OTP; bot **trả lại từng OTP theo đúng thứ tự, kèm SĐT của mã đó**.
 4. Admin **chỉ cần reply (trả lời) chính tin nhắn yêu cầu bằng mã OTP**
    (hoặc dùng `/guiotp <id> <mã>`) → bot **tự động gửi OTP cho khách** ngay.
-5. Bot chống spam/trùng: 1 acc chỉ có 1 yêu cầu chờ; mã không gửi 2 lần.
+   👉 Bot **hiểu mọi ngôn ngữ**: `123456`, `OTP: 123456`, `mã otp là 123456`,
+   `验证码 123456`, `رمز التحقق 123456`... đều gửi đúng mã.
+5. **Gửi kèm MẬT KHẨU / 2FA (tu chọn — có hay không đều được):**
+   - Admin reply: `123456 | matkhau | 2FAKEY` (thiếu phần nào cũng OK),
+     hoặc `/guiotp 12 123456 | matkhau | 2FAKEY`.
+   - Nếu admin chỉ gửi mỗi mã OTP, bot **tự lấy MK/2FA đã lưu của acc đó** gửi kèm
+     (khi tính năng đang bật — xem `/setaccinfo`).
+6. Bot chống spam/trùng: 1 acc chỉ có 1 yêu cầu chờ; mã không gửi 2 lần.
+
+###  Nhập acc kèm MẬT KHẨU / 2FA (tuỳ chọn)
+Gõ danh sách vào 1 tin nhắn rồi **reply** bằng `/addsll [vn|ngoai]`, mỗi dòng 1 acc:
+
+```
+0912345678 | matkhau123 | 2FAKEY
+0987654321 | matkhau456
+0913111222
+```
+
+- `mk` **và** `2fa` đều **tuỳ chọn**: có thể chỉ SĐT, SĐT + MK, hoặc SĐT + MK + 2FA.
+- Khi giao acc, bot hiện `sđt | mk | 2fa`; với OTP bot gửi kèm `🔒 MK` và `🛡 2FA`.
+- Bật/tắt việc gửi kèm cho khách: **`/setaccinfo on`** / **`/setaccinfo off`**
+  (mặc định lấy từ `SHOW_ACC_INFO=1` trong `.env`).
 
 ### 💳 Nạp tiền
 1. Bấm `💳 Nạp tiền` → chọn kênh trên bàn phím: `🏦 Ngân hàng (VietQR)` / `💵 USDT (BEP20)` / `💎 Gram (TON)`
@@ -107,14 +130,15 @@ Mỗi user có link `https://t.me/<bot>?start=ref<id>` — người được gi�
 ### Admin (lệnh slash + nút `🛠 Admin Panel`)
 | Lệnh | Chức năng |
 |---|---|
-| `/addsll 09xx 09yy ...` | Thêm SĐT (xuống dòng / cách / phẩy đều được; hoặc reply tin nhắn chứa danh sách) |
+| `/addsll [vn\|ngoai] 09xx 09yy ...` | Thêm SĐT (cách / xuống dòng / phẩy; hoặc **reply** danh sách). Kèm MK/2FA tuỳ chọn: mỗi dòng `sdt \| mk \| 2fa` |
+| `/setaccinfo on\|off` | Bật/tắt gửi kèm **MK + 2FA** cho khách khi giao acc / gửi OTP |
 | `/delsll <sdt>` | Xoá 1 acc khả dụng |
 | `/stock` hoặc nút `📦 Kho acc` | Xem kho |
 | `/pending` hoặc nút `⏳ Nạp chờ duyệt` | Danh sách nạp chờ duyệt |
 | `/duyet <id>` / `/tuchoi <id>` | Duyệt / từ chối nạp |
 | **Reply tin nhắn YC OTP bằng mã OTP** | Gửi OTP cho khách (cách nhanh nhất) |
 | `/otplist` hoặc nút `🔑 OTP chờ gửi` | Danh sách yêu cầu OTP đang chờ |
-| `/guiotp <id> <mã>` | Gửi OTP cho khách theo số yêu cầu |
+| `/guiotp <id> <mã>` | Gửi OTP cho khách theo số yêu cầu. Kèm MK/2FA: `/guiotp <id> <mã> \| mk \| 2fa` |
 | `/setpack <size> <giá>` | Tạo/đổi giá gói |
 | `/setprice <giá>` | Đổi giá acc lẻ |
 | `/setrate <usdt\|ton> <vnd>` | Đổi tỉ giá USDT/TON |

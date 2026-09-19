@@ -11,11 +11,19 @@ TELE SHOP BOT — VPS EDITION v2 (Reply Keyboard)
 - Mua Acc Telegram: chọn "🎟 Mua gói acc" (10/20/50/100...) hoặc "📱 Mua acc lẻ".
 - Nạp tiền: 🏦 Bank (VietQR) / 💵 USDT (BEP20) / 💎 Gram (TON) -> user bấm
   "✅ Tôi đã chuyển tiền" -> bot gửi yêu cầu vào chat ADMIN để duyệt.
-- Sau khi mua acc: bot hiện nút "🔑 Nhận OTP" dưới mỗi acc.
-  User bấm nút (hoặc /layotp <sdt>) -> bot gửi yêu cầu OTP tới admin kèm
-  @username người mua + ID Telegram + SĐT acc mua.
-  Admin chỉ cần REPLY tin nhắn yêu cầu bằng mã OTP (hoặc /guiotp <id> <ma>)
-  -> bot tự động gửi mã OTP cho khách.
+- Sau khi mua acc: bot hiện nút "🔑 Nhận OTP" dưới mỗi acc (100%).
+  User bấm nút (hoặc /layotp <sdt>, hoặc /layotpsll <sdt1> <sdt2> ... cho đơn SLL,
+  tối đa 10 SĐT/lần) -> bot gửi yêu cầu OTP tới chat ADMIN kèm
+  tên người mua (tên Telegram) + ID Telegram + SĐT acc đã mua.
+  Admin chỉ cần REPLY tin nhắn yêu cầu bằng mã OTP (mọi ngôn ngữ đều hiểu,
+  hoặc /guiotp <id> <ma>) -> bot tự động gửi mã OTP cho khách.
+- Nhập acc kèm MẬT KHẨU / 2FA (tuỳ chọn) — reply danh sách bằng /addsll:
+     0912345678 | matkhau123 | 2FAKEY
+     0987654321 | matkhau456
+  Bật/tắt gửi kèm MK + 2FA cho khách: /setaccinfo on|off
+  Admin gửi OTP kèm MK/2FA: reply "123456 | mk | 2fa" hoặc /guiotp 12 123456 | mk | 2fa
+- Phân loại kho: Acc Việt 🇻🇳 / Acc Ngoại 🌍 (giá + gói riêng từng loại).
+- Toàn bộ việc lấy OTP diễn ra NGAY TẠI BOT (không cần liên hệ admin thủ công).
 
 Chạy: python3 bot_vps.py
 """
@@ -29,6 +37,7 @@ import os
 import re
 import sqlite3
 import threading
+import unicodedata
 import urllib.parse
 from datetime import datetime
 
@@ -164,19 +173,17 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sll_accs(
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone    TEXT UNIQUE NOT NULL,
-                kind     TEXT NOT NULL DEFAULT 'vn',
                 status   TEXT NOT NULL DEFAULT 'available',
                 sold_to  INTEGER,
                 sold_at  TEXT,
                 order_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_sll_status ON sll_accs(status);
-            CREATE INDEX IF NOT EXISTS idx_sll_kind_status ON sll_accs(kind, status);
+            CREATE INDEX IF NOT EXISTS idx_sll_phone ON sll_accs(phone);
             CREATE TABLE IF NOT EXISTS orders(
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    INTEGER NOT NULL,
                 kind       TEXT NOT NULL,
-                acc_kind   TEXT,
                 qty        INTEGER NOT NULL,
                 price      REAL NOT NULL,
                 status     TEXT NOT NULL DEFAULT 'PAID',
@@ -202,7 +209,6 @@ def init_db() -> None:
                 PRIMARY KEY(size, kind)
             );
             CREATE INDEX IF NOT EXISTS idx_packages_size ON packages(size);
-            CREATE INDEX IF NOT EXISTS idx_packages_kind ON packages(kind);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS otp_requests(
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,57 +230,76 @@ def init_db() -> None:
             );
             """
         )
-        try:
-            con.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
-        except sqlite3.OperationalError:
-            pass  # cột đã tồn tại
-        # ── Migrate DB cũ: packages(size PK) -> packages(size, kind PK) ──
-        cols = [r["name"] for r in con.execute("PRAGMA table_info(packages)").fetchall()]
-        if "kind" not in cols:
-            con.execute(
-                "CREATE TABLE IF NOT EXISTS packages_new("
-                "size INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'vn', "
-                "price REAL NOT NULL, PRIMARY KEY(size, kind))"
-            )
-            con.execute(
-                "INSERT OR IGNORE INTO packages_new(size, kind, price) "
-                "SELECT size, 'vn', price FROM packages"
-            )
-            con.execute("DROP TABLE packages")
-            con.execute("ALTER TABLE packages_new RENAME TO packages")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_packages_size ON packages(size)")
-            con.execute("CREATE INDEX IF NOT EXISTS idx_packages_kind ON packages(kind)")
-        # ── Migrate DB cũ (chưa có cột kind trong sll_accs / acc_kind trong orders) ──
-        for ddl in (
-            "ALTER TABLE sll_accs ADD COLUMN kind TEXT NOT NULL DEFAULT 'vn'",
-            "ALTER TABLE orders ADD COLUMN acc_kind TEXT",
+        # ─ 1) Migrate: thêm cột còn thiếu (chạy TRƯỚC mọi index trên cột mới) ──
+        def _has_col(table: str, col: str) -> bool:
+            try:
+                return col in [
+                    r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()
+                ]
+            except sqlite3.OperationalError:
+                return False
+
+        for table, col, ddl in (
+            ("users", "referred_by", "ALTER TABLE users ADD COLUMN referred_by INTEGER"),
+            ("sll_accs", "password", "ALTER TABLE sll_accs ADD COLUMN password TEXT"),
+            ("sll_accs", "twofa", "ALTER TABLE sll_accs ADD COLUMN twofa TEXT"),
+            ("sll_accs", "kind", "ALTER TABLE sll_accs ADD COLUMN kind TEXT NOT NULL DEFAULT 'vn'"),
+            ("orders", "acc_kind", "ALTER TABLE orders ADD COLUMN acc_kind TEXT"),
         ):
+            if _has_col(table, col):
+                continue
             try:
                 con.execute(ddl)
-            except sqlite3.OperationalError:
-                pass
-        con.execute(
-            "UPDATE sll_accs SET kind='vn' WHERE kind IS NULL OR kind=''"
-        )
-        con.execute(
-            "UPDATE packages SET kind='vn' WHERE kind IS NULL OR kind=''"
-        )
-        con.execute("CREATE INDEX IF NOT EXISTS idx_sll_kind_status ON sll_accs(kind, status)")
-        # Backfill 'kind' cho các acc cũ theo đầu số SĐT
-        backfill_rows = con.execute(
-            "SELECT phone FROM sll_accs WHERE kind='vn'"
-        ).fetchall()
-        con.close()
-# Backfill ngoài lock dài: tính kind rồi update theo lô
-    for r in backfill_rows:
-        k = detect_kind(r["phone"])
-        if k != "vn":
-            with _DB_LOCK:
-                con = db()
-                con.execute("UPDATE sll_accs SET kind=? WHERE phone=?", (k, r["phone"]))
-                con.close()
-    with _DB_LOCK:
-        con = db()
+                log.info("Migrate: thêm cột %s.%s", table, col)
+            except sqlite3.OperationalError as e:
+                log.warning("Migrate %s.%s lỗi: %s", table, col, e)
+
+        # ── 2) packages: DB cũ chỉ có (size, price) -> rebuild (size, kind, price) ──
+        if not _has_col("packages", "kind"):
+            try:
+                con.execute("DROP TABLE IF EXISTS packages_new")
+                con.execute(
+                    "CREATE TABLE packages_new("
+                    "size INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'vn', "
+                    "price REAL NOT NULL, PRIMARY KEY(size, kind))"
+                )
+                con.execute(
+                    "INSERT OR IGNORE INTO packages_new(size, kind, price) "
+                    "SELECT size, 'vn', price FROM packages"
+                )
+                con.execute("DROP TABLE packages")
+                con.execute("ALTER TABLE packages_new RENAME TO packages")
+                log.info("Migrate: packages -> (size, kind) xong")
+            except sqlite3.OperationalError as e:
+                log.warning("Migrate packages lỗi: %s", e)
+
+        # ── 3) Index tạo SAU migrate (DB cũ không vỡ vì thiếu cột) ──
+        for idx in (
+            "CREATE INDEX IF NOT EXISTS idx_sll_status ON sll_accs(status)",
+            "CREATE INDEX IF NOT EXISTS idx_sll_phone ON sll_accs(phone)",
+            "CREATE INDEX IF NOT EXISTS idx_sll_kind_status ON sll_accs(kind, status)",
+            "CREATE INDEX IF NOT EXISTS idx_packages_size ON packages(size)",
+            "CREATE INDEX IF NOT EXISTS idx_packages_kind ON packages(kind)",
+        ):
+            try:
+                con.execute(idx)
+            except sqlite3.OperationalError as e:
+                log.warning("Tạo index lỗi (%s): %s", idx, e)
+
+        # ─ 4) Backfill 'kind' cho acc cũ theo đầu số SĐT (chỉ chạy 1 lần) ──
+        if not con.execute(
+            "SELECT 1 FROM settings WHERE key='migrated_kind_v1'"
+        ).fetchone():
+            rows = con.execute("SELECT phone FROM sll_accs").fetchall()
+            fixes = [(detect_kind(r["phone"]), r["phone"]) for r in rows]
+            fixes = [(k, p) for k, p in fixes if k != "vn"]
+            if fixes:
+                con.executemany("UPDATE sll_accs SET kind=? WHERE phone=?", fixes)
+            con.execute(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES('migrated_kind_v1','1')"
+            )
+            log.info("Migrate: backfill kind cho %d acc", len(fixes))
+
         _seed_default_packages(con)
         con.close()
 
@@ -512,20 +537,123 @@ def parse_phones(text: str) -> list[str]:
     return out
 
 
+def parse_acc_lines(text: str) -> list[dict]:
+    """Parse danh sách acc — chấp nhận CẢ 2 định dạng:
+
+    1) Chỉ SĐT (cách nhau bằng dấu cách / phẩy / xuống dòng):
+           /addsll vn 0912345678 0987654321
+    2) Có kèm MK và 2FA — TUỲ CHỌN (mỗi acc 1 dòng, ngăn bằng '|'):
+           0912345678 | matkhau123 | 2FAKEY
+           0987654321 | matkhau456
+
+    Trả về [{'phone','password','twofa'}]; bỏ dòng không có SĐT hợp lệ / trùng.
+    """
+    out, seen = [], set()
+    normalized = normalize_text(text or "")
+    for raw in normalized.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            phone = (parts[0] if parts else "").lstrip("+")
+            pw = parts[1] if len(parts) > 1 else ""
+            t2 = parts[2] if len(parts) > 2 and parts[2] else None
+            if not re.fullmatch(r"\d{8,15}", phone) or phone in seen:
+                continue
+            seen.add(phone)
+            out.append({"phone": phone, "password": pw or "", "twofa": t2})
+        else:
+            for p in parse_phones(line):
+                if p in seen:
+                    continue
+                seen.add(p)
+                out.append({"phone": p, "password": "", "twofa": None})
+    return out
+
+
 def add_sll(phones: list[str], kind: str | None = None) -> tuple[int, int]:
-    """Thêm acc theo loại. Nếu kind=None -> tự đoán từng SĐT (VN/ngoại)."""
+    """Thêm acc theo loại. Mỗi phần tử có thể là SĐT (str) hoặc dict
+    {'phone','password','twofa'}. Nếu kind=None -> tự đoán từng SĐT (VN/ngoại)."""
     added = dup = 0
     with _DB_LOCK:
         con = db()
-        for p in phones:
+        for item in phones:
+            if isinstance(item, dict):
+                p = item.get("phone", "")
+                pw = item.get("password") or ""
+                t2 = item.get("twofa")
+            else:
+                p, pw, t2 = item, "", None
             k = kind or detect_kind(p)
             try:
-                con.execute("INSERT INTO sll_accs(phone, kind) VALUES(?,?)", (p, k))
+                con.execute(
+                    "INSERT INTO sll_accs(phone, kind, password, twofa) VALUES(?,?,?,?)",
+                    (p, k, pw, t2),
+                )
                 added += 1
             except sqlite3.IntegrityError:
                 dup += 1
         con.close()
     return added, dup
+
+
+def show_acc_info() -> bool:
+    """Có gửi kèm MK + 2FA cho khách không (setting /setaccinfo > .env SHOW_ACC_INFO)."""
+    v = get_setting("show_acc_info")
+    if v is None:
+        return str(os.getenv("SHOW_ACC_INFO", "1")).strip() not in (
+            "0", "off", "false", "no", "",
+        )
+    return str(v).strip() not in ("0", "off", "false", "no", "")
+
+
+def acc_info_map(phones: list) -> dict:
+    """Lấy MK/2FA của nhiều SĐT trong 1 query (nhanh cho đơn gói lớn)."""
+    if not phones:
+        return {}
+    marks = ",".join("?" * len(phones))
+    with _DB_LOCK:
+        con = db()
+        rows = con.execute(
+            f"SELECT phone, password, twofa FROM sll_accs WHERE phone IN ({marks})",
+            list(phones),
+        ).fetchall()
+        con.close()
+    return {r["phone"]: r for r in rows}
+
+
+def set_acc_info(phone: str, password: str | None = None, twofa: str | None = None) -> None:
+    """Lưu MK / 2FA mà admin gửi kèm (chỉ ghi khi có giá trị)."""
+    sets, args = [], []
+    if password:
+        sets.append("password=?")
+        args.append(password)
+    if twofa:
+        sets.append("twofa=?")
+        args.append(twofa)
+    if not sets:
+        return
+    args.append(phone)
+    with _DB_LOCK:
+        con = db()
+        con.execute(f"UPDATE sll_accs SET {', '.join(sets)} WHERE phone=?", args)
+        con.close()
+
+
+def format_acc(phone: str, info_map: dict | None = None) -> str:
+    """Dòng giao acc:  sdt | mk | 2fa  (mk/2fa chỉ thêm khi có + tính năng đang bật)."""
+    if info_map is None:
+        info_map = acc_info_map([phone])
+    row = info_map.get(phone)
+    pw = (row["password"] if row and row["password"] else "") if show_acc_info() else ""
+    t2 = (row["twofa"] if row and row["twofa"] else "") if show_acc_info() else ""
+    out = f"<code>{h(phone)}</code>"
+    if pw:
+        out += f" | <code>{h(pw)}</code>"
+    if t2:
+        out += f" | <code>{h(t2)}</code>"
+    return out
 
 
 def del_sll(phone: str) -> int:
@@ -1209,15 +1337,23 @@ async def flow_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     phones, referrer, bonus = result
     clear_state(context)
-    listing = "\n".join(f"{i}. <code>{h(p)}</code>" for i, p in enumerate(phones, 1))
+    info_map = acc_info_map(phones)
+    listing = "\n".join(
+        f"{i}. {format_acc(p, info_map)}" for i, p in enumerate(phones, 1)
+    )
+    has_info = any((r["password"] or r["twofa"]) for r in info_map.values())
+    title = (
+        "📞 <b>DANH SÁCH ACC (SĐT | MK | 2FA):</b>"
+        if has_info else "📞 <b>DANH SÁCH ACC:</b>"
+    )
     txt = (
         f"✅ <b>MUA THÀNH CÔNG</b>\n\n"
         f"🧾 Đơn: <b>#{order_id}</b> — {size} {KIND_NAME[kind]}\n"
         f"💸 Đã trừ: {vnd(price)}\n"
         f"💰 Số dư còn lại: {vnd(get_balance(uid))}\n\n"
-        f"📞 <b>DANH SÁCH ACC:</b>\n{listing}\n\n"
-        f"🔑 <b>Nhận mã OTP:</b> lấy OTP ngay tại bot này — bấm nút "
-        f"<b>🔑 Nhận OTP</b> ở tin nhắn bên dưới, mã được gửi lại tự động khi có."
+        f"{title}\n{listing}\n\n"
+        f"🔑 <b>Lấy OTP ngay tại bot này:</b> bấm nút <b>🔑 Nhận OTP</b> "
+        f"ở tin nhắn bên dưới — bot tự xử lý và gửi mã về cho bạn."
     )
     otp_rows = [
         [InlineKeyboardButton(f"🔑 Nhận OTP — {p}", callback_data=f"otp:req:{order_id}:{p}")]
@@ -1477,15 +1613,23 @@ async def notify_admin_otp(bot, rid: int, requester=None):
         full = requester.full_name or full
         uname = requester.username or uname
     buyer = f"@{h(uname)}" if uname else "Không có username"
+    info = acc_info_map([req["phone"]]).get(req["phone"])
+    extra = ""
+    if info:
+        if info["password"]:
+            extra += f"\n🔒 MK đã lưu: <code>{h(info['password'])}</code>"
+        if info["twofa"]:
+            extra += f"\n🛡 2FA đã lưu: <code>{h(info['twofa'])}</code>"
     txt = (
         f"🔑 <b>YÊU CẦU OTP #{rid}</b>\n\n"
         f"👤 Tên người mua (tên Telegram): <b>{h(full or 'user')}</b> — {buyer}\n"
         f"🆔 ID Telegram: <code>{req['user_id']}</code>\n"
         f"📞 SĐT acc đã mua: <code>{h(req['phone'])}</code>\n"
         f"🧾 Đơn hàng: <b>#{req['order_id']}</b>\n"
-        f"🕐 {req['created_at']}\n\n"
+        f"🕐 {req['created_at']}{extra}\n\n"
         "👉 <b>Reply (trả lời) chính tin nhắn này bằng mã OTP</b> — bot sẽ tự gửi cho khách.\n"
-        f"Hoặc dùng: <code>/guiotp {rid} &lt;ma_otp&gt;</code>"
+        f"Hoặc dùng: <code>/guiotp {rid} &lt;ma_otp&gt;</code>\n"
+        "💡 Gửi kèm MK/2FA (tuỳ chọn): <code>123456 | mk | 2fa</code>"
     )
     for aid in ADMIN_IDS:
         try:
@@ -1515,13 +1659,13 @@ async def flow_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE, p
     if open_req:
         await update.effective_message.reply_html(
             f"⏳ Bạn đã gửi yêu cầu OTP cho acc <code>{h(phone)}</code> (yêu cầu #{open_req['id']}).\n"
-            f"Vui lòng chờ <b>@{ADMIN_USERNAME}</b> gửi mã — bot sẽ gửi lại ngay khi có."
+            "Bot sẽ tự động gửi lại mã OTP cho bạn ngay khi có."
         )
         return
     rid = create_otp_request(uid, phone, None)
     await update.effective_message.reply_html(
         f"✅ <b>Đã gửi yêu cầu OTP #{rid}</b> cho acc <code>{h(phone)}</code>.\n"
-        f"⏳ Chờ <b>@{ADMIN_USERNAME}</b> gửi mã — bot sẽ tự động gửi lại cho bạn."
+        "⏳ Bot sẽ tự động gửi lại mã OTP cho bạn ngay khi có."
     )
     await notify_admin_otp(context.bot, rid, update.effective_user)
 
@@ -1583,8 +1727,7 @@ async def cmd_layotpsll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await msg.reply_html(
         f"✅ <b>Đã gửi {len(ok_rids)} yêu cầu OTP SLL:</b>\n{lst}\n"
-        f"⏳ Chờ <b>@{ADMIN_USERNAME}</b> gửi từng mã — "
-        f"bot sẽ trả lại từng OTP cho bạn theo đúng thứ tự kèm SĐT."
+        f"⏳ Bot sẽ trả lại từng OTP cho bạn theo đúng thứ tự kèm SĐT ngay khi có mã."
         + (f"\n\n⚠️ Bỏ qua (đã gửi từ trước): " + ", ".join(f"<code>{h(x)}</code>" for x in skip_dup) if skip_dup else "")
         + (f"\n⚠️ Bỏ qua (bạn chưa mua): " + ", ".join(f"<code>{h(x)}</code>" for x in skip_own) if skip_own else "")
     )
@@ -1593,38 +1736,95 @@ async def cmd_layotpsll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_admin_otp(context.bot, rid, update.effective_user)
 
 
-async def deliver_otp_to_client(context: ContextTypes.DEFAULT_TYPE, req, otp: str):
-    """Gửi OTP cho khách. Trả True nếu gửi thành công lần đầu."""
+async def deliver_otp_to_client(
+    context: ContextTypes.DEFAULT_TYPE,
+    req,
+    otp: str,
+    password: str | None = None,
+    twofa: str | None = None,
+):
+    """Gửi OTP cho khách. Trả True nếu gửi thành công lần đầu.
+
+    - password / twofa: admin gửi KÈM mã OTP (tuỳ chọn) -> bot lưu lại vào acc
+      và gửi luôn cho khách.
+    - Nếu admin không gửi kèm, bot tự lấy MK/2FA đã lưu của acc đó
+      (khi tính năng gửi kèm đang bật bằng /setaccinfo on).
+    """
+    info = acc_info_map([req["phone"]]).get(req["phone"])
+    pw = password or ((info["password"] or "") if info and show_acc_info() else "")
+    t2 = twofa or ((info["twofa"] or "") if info and show_acc_info() else "")
+    if password or twofa:
+        set_acc_info(req["phone"], password, twofa)   # ghi nhớ cho lần sau
     done = fulfill_otp_request(req["id"], otp)
     if not done:
         return False
+    body = (
+        f"🔑 <b>MÃ OTP CHO ACC</b> <code>{h(req['phone'])}</code>\n\n"
+        f"<code>{h(otp)}</code>\n"
+    )
+    if pw:
+        body += f"\n🔒 <b>MK:</b> <code>{h(pw)}</code>"
+    if t2:
+        body += f"\n🛡 <b>2FA:</b> <code>{h(t2)}</code>"
+    body += "\n\n⏳ Mã có hiệu lực ngắn — nhập ngay để đăng nhập nhé!"
     ok = True
     try:
-        await context.bot.send_message(
-            req["user_id"],
-            f"🔑 <b>MÃ OTP CHO ACC</b> <code>{h(req['phone'])}</code>\n\n"
-            f"<code>{h(otp)}</code>\n\n"
-            "⏳ Mã có hiệu lực ngắn — nhập ngay để đăng nhập nhé!",
-            parse_mode=ParseMode.HTML,
-        )
+        await context.bot.send_message(req["user_id"], body, parse_mode=ParseMode.HTML)
     except TelegramError as e:
         ok = False
         log.warning("Không gửi được OTP cho user %s: %s", req["user_id"], e)
     return ok
 
 
+def normalize_text(text: str) -> str:
+    """Chuẩn hoá full-width + mọi hệ chữ số (Rập/Thái/Miến/Trung...) về ASCII."""
+    t = (text or "").replace("｜", "|")
+    out = []
+    for ch in t:
+        if ch.isdigit() and not ch.isascii():
+            try:
+                out.append(str(unicodedata.digit(ch)))
+            except (TypeError, ValueError):
+                out.append(ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _extract_otp(text: str) -> str:
-    """Đọc mã OTP từ tin nhắn admin (vd '123456' hoặc 'ma otp la 123456')."""
-    t = (text or "").strip()
+    """Đọc mã OTP từ tin nhắn admin — KHÔNG giới hạn ngôn ngữ.
+
+    Nhận mọi cách viết: '123456', 'ma otp la 123456', 'OTP: 123456',
+    '验证码 123456', 'رمز التحقق 123456', 'mã xác minh là 123456'...
+    """
+    t = normalize_text(text).strip()
     if not t:
         return ""
     if re.fullmatch(r"[A-Za-z0-9\-]{3,16}", t):
         return t
     tokens = re.findall(r"[A-Za-z0-9\-]{3,16}", t)
-    for tok in reversed(tokens):        # ưu tiên token toàn số
-        if tok.isdigit():
-            return tok
+    digits = [x for x in tokens if x.isdigit()]
+    if digits:
+        return digits[-1]
     return tokens[-1] if tokens else t[:16]
+
+
+def parse_otp_payload(text: str) -> tuple[str, str | None, str | None]:
+    """Admin gửi mã OTP, CÓ THỂ kèm MK / 2FA (tuỳ chọn). Trả (otp, mk, 2fa).
+
+    - '123456'                    -> ('123456', None, None)
+    - '123456 | mk123 | 2faXYZ'   -> ('123456', 'mk123', '2faXYZ')
+    - '123456 | mk123'            -> ('123456', 'mk123', None)
+    - 'mã otp là 123456'          -> ('123456', None, None)  (mọi ngôn ngữ)
+    """
+    t = normalize_text(text).strip()
+    if "|" in t:
+        parts = [p.strip() for p in t.split("|")]
+        otp = _extract_otp(parts[0])
+        pw = parts[1] if len(parts) > 1 and parts[1] else None
+        t2 = parts[2] if len(parts) > 2 and parts[2] else None
+        return otp, pw, t2
+    return _extract_otp(t), None, None
 
 
 async def cb_otp_by_phone(update: Update, context: ContextTypes.DEFAULT_TYPE, phone: str):
@@ -1642,7 +1842,7 @@ async def cb_otp_by_phone(update: Update, context: ContextTypes.DEFAULT_TYPE, ph
     open_req = get_open_otp_request(uid, phone)
     if open_req:
         await update.effective_message.reply_html(
-            f"⏳ Đã gửi yêu cầu OTP #{open_req['id']} cho acc <code>{h(phone)}</code> — chờ admin gửi mã nhé!"
+            f"⏳ Đã gửi yêu cầu OTP #{open_req['id']} cho acc <code>{h(phone)}</code> — bot sẽ gửi mã lại ngay khi có nhé!"
         )
         return
     order_id = None
@@ -1657,8 +1857,8 @@ async def cb_otp_by_phone(update: Update, context: ContextTypes.DEFAULT_TYPE, ph
             order_id = row["order_id"]
     rid = create_otp_request(uid, phone, order_id)
     await update.effective_message.reply_html(
-        f"✅ <b>Đã gửi yêu cầu OTP #{rid}</b> cho acc <code>{h(phone)}</code> tới admin.\n"
-        f"⏳ Bot sẽ gửi lại mã OTP ngay khi admin phản hồi."
+        f"✅ <b>Đã gửi yêu cầu OTP #{rid}</b> cho acc <code>{h(phone)}</code>.\n"
+        "⏳ Bot sẽ gửi lại mã OTP cho bạn ngay khi có."
     )
     await notify_admin_otp(context.bot, rid, update.effective_user)
 
@@ -1680,7 +1880,7 @@ async def cb_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     open_req = get_open_otp_request(uid, phone)
     if open_req:
         await q.answer(
-            f"⏳ Đã gửi yêu cầu OTP #{open_req['id']} — chờ admin gửi mã nhé!",
+            f"⏳ Đã gửi yêu cầu OTP #{open_req['id']} — bot sẽ gửi mã lại ngay khi có nhé!",
             show_alert=True,
         )
         return
@@ -1690,13 +1890,13 @@ async def cb_otp_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         pass
     rid = create_otp_request(uid, phone, order_id)
-    await q.answer("✅ Đã gửi yêu cầu OTP tới admin!", show_alert=True)
+    await q.answer("✅ Đã gửi yêu cầu OTP!", show_alert=True)
     await notify_admin_otp(context.bot, rid, q.from_user)
     try:
         await q.message.reply_html(
             f"🔑 <b>YÊU CẦU OTP #{rid}</b>\n"
             f"📞 Acc: <code>{h(phone)}</code>\n"
-            f"✅ Đã gửi tới <b>@{ADMIN_USERNAME}</b> — bot sẽ tự động gửi mã OTP cho bạn ngay khi admin phản hồi."
+            "✅ Bot sẽ tự động gửi mã OTP cho bạn ngay khi có."
         )
     except TelegramError:
         pass
@@ -1726,13 +1926,16 @@ async def flow_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Kho acc: {stock_count('vn')} Việt / {stock_count('ngoai')} Ngoại\n\n"
         "📋 <b>Lệnh nhanh:</b>\n"
         "• <code>/addsll [vn|ngoai] &lt;sdt...&gt;</code> — nhập acc (tự đoán nếu thiếu loại)\n"
+        "• <code>/addsll [vn|ngoai]</code> khi <b>reply</b> danh sách — nhập kèm MK/2FA,\n"
+        "   mỗi dòng: <code>sdt | mk | 2fa</code> (mk, 2fa <b>tuỳ chọn</b>)\n"
+        "• <code>/setaccinfo on|off</code> — bật/tắt gửi kèm MK + 2FA cho khách\n"
         "• <code>/delsll &lt;sdt&gt;</code> — xoá acc\n"
+        "• <code>/stock [vn|ngoai]</code> — xem kho từng loại\n"
         "• <code>/duyet &lt;id&gt;</code> / <code>/tuchoi &lt;id&gt;</code> — duyệt nạp\n"
         "• <code>/otplist</code> — YC OTP đang chờ (hoặc nút 🔑 OTP chờ gửi)\n"
         "• <code>/guiotp &lt;id&gt; &lt;ma&gt;</code> — gửi OTP cho khách\n"
-        "   (hoặc chỉ cần <b>reply</b> tin nhắn YC OTP bằng mã OTP)\n"
-        "• <code>/addsll [vn|ngoai] &lt;sdt...&gt;</code> — nhập acc (tự đoán nếu thiếu loại)\n"
-        "• <code>/stock [vn|ngoai]</code> — xem kho từng loại\n"
+        "   kèm MK/2FA: <code>/guiotp &lt;id&gt; &lt;ma&gt; | mk | 2fa</code>\n"
+        "   (hoặc chỉ cần <b>reply</b> tin nhắn YC OTP — không giới hạn ngôn ngữ)\n"
         "• <code>/setpack &lt;vn|ngoai&gt; &lt;size&gt; &lt;giá&gt;</code> — giá gói từng loại\n"
         "• <code>/setprice &lt;vn|ngoai&gt; &lt;giá&gt;</code> — giá acc lẻ từng loại\n"
         "• <code>/setrate &lt;usdt|ton&gt; &lt;vnd&gt;</code> — tỉ giá\n"
@@ -1816,28 +2019,34 @@ async def cmd_addsll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(args)
     if not text and msg.reply_to_message:
         text = msg.reply_to_message.text or ""
-    phones = parse_phones(text)
-    if not phones:
+    accs = parse_acc_lines(text)
+    if not accs:
         await msg.reply_html(
             "📝 <b>Cách dùng /addsll:</b>\n"
+            "🔹 <b>Chỉ SĐT</b> (tự đoán Việt/Ngoại):\n"
             "<code>/addsll vn 0912345678 0987654321</code> — ép Acc Việt\n"
             "<code>/addsll ngoai 14155551234 4477009001</code> — ép Acc Ngoại\n"
             "<code>/addsll 0912345678 14155551234</code> — tự đoán từng SĐT\n"
-            "SĐT cách nhau bằng dấu cách, xuống dòng hoặc phẩy;\n"
-            "hoặc reply tin nhắn chứa danh sách SĐT bằng /addsll"
+            "🔹 <b>Kèm MK / 2FA (tu chọn)</b> — mỗi acc 1 dòng, ngăn bằng <code>|</code>:\n"
+            "<code>0912345678 | matkhau123 | 2FAKEY</code>\n"
+            "<code>0987654321 | matkhau456</code>\n"
+            "→ gõ danh sách vào 1 tin nhắn rồi <b>reply</b> tin đó bằng "
+            "<code>/addsll [vn|ngoai]</code>\n"
+            " SĐT cách nhau bằng dấu cách, xuống dòng hoặc phẩy."
         )
         return
-    added, dup = add_sll(phones, kind)
+    added, dup = add_sll(accs, kind)
+    with_info = sum(1 for a in accs if a["password"] or a["twofa"])
     if kind:
-        c_vn = sum(1 for p in phones if detect_kind(p) == "vn")
-        c_nn = len(phones) - c_vn
         detail = f" ({KIND_NAME[kind]})"
     else:
-        c_vn = sum(1 for p in phones if detect_kind(p) == "vn")
-        c_nn = len(phones) - c_vn
+        c_vn = sum(1 for a in accs if detect_kind(a["phone"]) == "vn")
+        c_nn = len(accs) - c_vn
         detail = f" (tự đoán: {c_vn} Việt / {c_nn} Ngoại)"
     await msg.reply_html(
-        f"✅ <b>Đã thêm {added} acc SLL</b>{detail}" + (f" (bỏ qua {dup} trùng)" if dup else "")
+        f"✅ <b>Đã thêm {added} acc SLL</b>{detail}"
+        + (f" (bỏ qua {dup} trùng)" if dup else "")
+        + (f"\n🔐 Acc có kèm MK/2FA: <b>{with_info}</b>" if with_info else "")
         + f"\n📦 Kho hiện tại: <b>{stock_count('vn')}</b> Việt / <b>{stock_count('ngoai')}</b> Ngoại"
     )
 
@@ -2002,6 +2211,38 @@ async def cmd_setaff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_setaccinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setaccinfo on|off — có gửi kèm MK + 2FA cho khách không (tuỳ chọn).
+
+    • ON : khi giao acc / gửi OTP, bot gửi kèm MK + 2FA của acc (nếu có).
+    • OFF: chỉ gửi SĐT (và mã OTP).
+    """
+    if not context.args:
+        await update.effective_message.reply_html(
+            "🔐 <b>Gửi kèm MK + 2FA cho khách</b>\n\n"
+            f"Trạng thái hiện tại: <b>{'ON' if show_acc_info() else 'OFF'}</b>\n\n"
+            "Dùng: <code>/setaccinfo on</code> hoặc <code>/setaccinfo off</code>\n"
+            "• <b>on</b>: giao acc + OTP kèm <b>MK</b> và <b>2FA</b> (nếu acc có).\n"
+            "• <b>off</b>: chỉ gửi SĐT và mã OTP.\n"
+            "👉 Nhập acc kèm MK/2FA: reply danh sách bằng <code>/addsll [vn|ngoai]</code>\n"
+            "   định dạng mỗi dòng: <code>sdt | mk | 2fa</code> (2fa tuỳ chọn)."
+        )
+        return
+    val = context.args[0].strip().lower()
+    if val in ("1", "on", "true", "yes", "bat", "bật"):
+        on = True
+    elif val in ("0", "off", "false", "no", "tat", "tắt"):
+        on = False
+    else:
+        await update.effective_message.reply_text("❌ Dùng: /setaccinfo on hoặc /setaccinfo off")
+        return
+    set_setting("show_acc_info", "1" if on else "0")
+    await update.effective_message.reply_html(
+        f"✅ Đã {'BẬT' if on else 'TẮT'} gửi kèm MK/2FA cho khách."
+    )
+
+
+@admin_only
 async def cmd_addbal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2 or not context.args[0].lstrip("-").isdigit():
         await update.effective_message.reply_text("Dùng: /addbal <user_id> <so_tien>")
@@ -2025,16 +2266,20 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_guiotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/guiotp <id_yeu_cau> <ma_otp> — admin gửi OTP cho khách."""
+    """/guiotp <id_yeu_cau> <ma_otp> — admin gửi OTP cho khách.
+
+    Có thể gửi kèm MK / 2FA (tuỳ chọn): /guiotp 12 123456 | mk | 2fa
+    """
     if len(context.args) < 2 or not context.args[0].isdigit():
         await update.effective_message.reply_html(
             "📝 Dùng: <code>/guiotp &lt;id_yeu_cau&gt; &lt;ma_otp&gt;</code>\n"
             "vd: <code>/guiotp 12 123456</code>\n"
+            "💡 Gửi kèm MK/2FA (tuỳ chọn): <code>/guiotp 12 123456 | mk | 2fa</code>\n"
             "👉 Hoặc chỉ cần <b>reply</b> tin nhắn yêu cầu OTP bằng mã OTP."
         )
         return
     key = int(context.args[0])
-    otp = _extract_otp(" ".join(context.args[1:]))
+    otp, pw, t2 = parse_otp_payload(" ".join(context.args[1:]))
     req = get_otp_request(key)
     if not req:
         # Admin hay nhầm: gửi ID Telegram của khách thay vì ID yêu cầu.
@@ -2053,11 +2298,17 @@ async def cmd_guiotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             + (f" (mã: <code>{h(req['otp'])}</code>)" if req["otp"] else "") + "."
         )
         return
-    ok = await deliver_otp_to_client(context, req, otp)
+    if not otp:
+        await update.effective_message.reply_text(
+            "❌ Không đọc được mã OTP. Dùng: /guiotp <id> <ma_otp>"
+        )
+        return
+    ok = await deliver_otp_to_client(context, req, otp, pw, t2)
     if ok:
         await update.effective_message.reply_html(
             f"✅ Đã gửi OTP cho khách <b>@{h(get_username(req['user_id']))}</b> "
             f"(user {req['user_id']}, acc <code>{h(req['phone'])}</code>)."
+            + (f"\n🔒 Kèm MK{'+ 2FA' if t2 else ''}." if (pw or t2) else "")
         )
     else:
         await update.effective_message.reply_html(
@@ -2110,16 +2361,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"⚠️ Yêu cầu OTP #{req['id']} đã được gửi trước đó rồi."
                 )
                 return
-            code = _extract_otp(text)
+            code, pw, t2 = parse_otp_payload(text)
             if not code:
-                await msg.reply_text("❌ Không đọc được mã OTP. Reply lại với mã (vd: 123456).")
+                await msg.reply_html(
+                    "❌ Không đọc được mã OTP. Reply lại với mã (vd: <code>123456</code>).\n"
+                    "💡 Gửi kèm MK/2FA (tu chọn): <code>123456 | mk | 2fa</code>"
+                )
                 return
-            ok = await deliver_otp_to_client(context, req, code)
+            ok = await deliver_otp_to_client(context, req, code, pw, t2)
             if ok:
+                extra = ""
+                if pw or t2:
+                    extra = f"\n🔒 Kèm: {'MK ' if pw else ''}{'+ 2FA' if t2 else ''}".strip()
                 await msg.reply_html(
                     f"✅ Đã gửi OTP <code>{h(code)}</code> cho khách "
                     f"<b>@{h(get_username(req['user_id']))}</b> "
-                    f"(user {req['user_id']}, acc <code>{h(req['phone'])}</code>)."
+                    f"(user {req['user_id']}, acc <code>{h(req['phone'])}</code>).{extra}"
                 )
             else:
                 await msg.reply_html(
@@ -2278,13 +2535,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
-def main() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit("❌ Thiếu BOT_TOKEN trong file .env")
-    if not ADMIN_IDS:
-        raise SystemExit("❌ Thiếu ADMIN_IDS trong file .env")
-
-    init_db()
+def build_app() -> Application:
+    """Tạo Application + đăng ký toàn bộ handler (tách ra để test được)."""
     req = HTTPXRequest(connection_pool_size=256)
     get_req = HTTPXRequest(connection_pool_size=256)
     app = (
@@ -2308,6 +2560,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setprice", cmd_setprice), group=0)
     app.add_handler(CommandHandler("setrate", cmd_setrate), group=0)
     app.add_handler(CommandHandler("setaff", cmd_setaff), group=0)
+    app.add_handler(CommandHandler("setaccinfo", cmd_setaccinfo), group=0)
     app.add_handler(CommandHandler("addbal", cmd_addbal), group=0)
     app.add_handler(CommandHandler("stats", cmd_stats), group=0)
     app.add_handler(CommandHandler("layotp", cmd_layotp), group=0)
@@ -2322,6 +2575,17 @@ def main() -> None:
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message), group=1)
     app.add_error_handler(on_error)
+    return app
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("❌ Thiếu BOT_TOKEN trong file .env")
+    if not ADMIN_IDS:
+        raise SystemExit("❌ Thiếu ADMIN_IDS trong file .env")
+
+    init_db()
+    app = build_app()
 
     log.info("🚀 Bot đang chạy (Reply Keyboard mode)... Admin: %s", sorted(ADMIN_IDS))
     app.run_polling(
