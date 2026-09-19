@@ -99,16 +99,29 @@ VIETQR_TEMPLATE = os.getenv("VIETQR_TEMPLATE", "compact2").strip()
 USDT_BEP20_ADDRESS = os.getenv("USDT_BEP20_ADDRESS", "").strip()
 TON_ADDRESS = os.getenv("TON_ADDRESS", "").strip()
 
-# ── Nạp tiền / bán hàng ──
+# ── Nạp tiền / bán hàng: giá riêng Acc Việt / Acc Ngoại ──
 MIN_DEPOSIT_VND = _float("MIN_DEPOSIT_VND", 20000)
 DEFAULT_USDT_RATE = _float("USDT_RATE_VND", 26000)   # 1 USDT = ? VND
 DEFAULT_TON_RATE = _float("TON_RATE_VND", 80000)     # 1 TON (Gram) = ? VND
-DEFAULT_PACK_PRICE = _float("PACK_PRICE_PER_ACC", 50000)  # giá mặc định / acc
-PACK_SIZES = [
+PACK_PRICE_VN = _float("PACK_PRICE_VN", 0) or None        # giá lẻ 1 acc VN
+PACK_PRICE_NGOAI = _float("PACK_PRICE_NGOAI", 0) or None  # giá lẻ 1 acc Ngoại
+DEFAULT_PACK_PRICE = _float("PACK_PRICE_PER_ACC", 50000)  # fallback cũ
+PACK_SIZES_VN = [
     int(x)
-    for x in re.split(r"[,\s]+", os.getenv("PACK_SIZES", "10,20,50,100").strip())
+    for x in re.split(r"[,\s]+", os.getenv("PACK_SIZES_VN", os.getenv("PACK_SIZES", "10,20,50,100")).strip())
     if x.strip().isdigit()
 ] or [10, 20, 50, 100]
+PACK_SIZES_NGOAI = [
+    int(x)
+    for x in re.split(r"[,\s]+", os.getenv("PACK_SIZES_NGOAI", os.getenv("PACK_SIZES", "10,20,50,100")).strip())
+    if x.strip().isdigit()
+] or [10, 20, 50, 100]
+PACK_SIZES = [{"size": s, "kind": k} for k in ("vn", "ngoai")
+              for s in (PACK_SIZES_VN if k == "vn" else PACK_SIZES_NGOAI)]
+BASE_PRICE = {
+    "vn": PACK_PRICE_VN if PACK_PRICE_VN else DEFAULT_PACK_PRICE,
+    "ngoai": PACK_PRICE_NGOAI if PACK_PRICE_NGOAI else DEFAULT_PACK_PRICE,
+}
 AFF_PERCENT_DEFAULT = _float("AFF_PERCENT", 5)  # % hoa hồng tiếp thị
 
 VIETQR_URL = "https://img.vietqr.io/image"
@@ -151,16 +164,19 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sll_accs(
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone    TEXT UNIQUE NOT NULL,
+                kind     TEXT NOT NULL DEFAULT 'vn',
                 status   TEXT NOT NULL DEFAULT 'available',
                 sold_to  INTEGER,
                 sold_at  TEXT,
                 order_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_sll_status ON sll_accs(status);
+            CREATE INDEX IF NOT EXISTS idx_sll_kind_status ON sll_accs(kind, status);
             CREATE TABLE IF NOT EXISTS orders(
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    INTEGER NOT NULL,
                 kind       TEXT NOT NULL,
+                acc_kind   TEXT,
                 qty        INTEGER NOT NULL,
                 price      REAL NOT NULL,
                 status     TEXT NOT NULL DEFAULT 'PAID',
@@ -180,9 +196,13 @@ def init_db() -> None:
                 handled_at  TEXT
             );
             CREATE TABLE IF NOT EXISTS packages(
-                size  INTEGER PRIMARY KEY,
-                price REAL NOT NULL
+                size  INTEGER NOT NULL,
+                kind  TEXT NOT NULL DEFAULT 'vn',
+                price REAL NOT NULL,
+                PRIMARY KEY(size, kind)
             );
+            CREATE INDEX IF NOT EXISTS idx_packages_size ON packages(size);
+            CREATE INDEX IF NOT EXISTS idx_packages_kind ON packages(kind);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS otp_requests(
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,16 +224,71 @@ def init_db() -> None:
             );
             """
         )
-        for size in PACK_SIZES:
-            con.execute(
-                "INSERT OR IGNORE INTO packages(size, price) VALUES(?,?)",
-                (size, DEFAULT_PACK_PRICE * size),
-            )
         try:
             con.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
         except sqlite3.OperationalError:
             pass  # cột đã tồn tại
+        # ── Migrate DB cũ: packages(size PK) -> packages(size, kind PK) ──
+        cols = [r["name"] for r in con.execute("PRAGMA table_info(packages)").fetchall()]
+        if "kind" not in cols:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS packages_new("
+                "size INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'vn', "
+                "price REAL NOT NULL, PRIMARY KEY(size, kind))"
+            )
+            con.execute(
+                "INSERT OR IGNORE INTO packages_new(size, kind, price) "
+                "SELECT size, 'vn', price FROM packages"
+            )
+            con.execute("DROP TABLE packages")
+            con.execute("ALTER TABLE packages_new RENAME TO packages")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_packages_size ON packages(size)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_packages_kind ON packages(kind)")
+        # ── Migrate DB cũ (chưa có cột kind trong sll_accs / acc_kind trong orders) ──
+        for ddl in (
+            "ALTER TABLE sll_accs ADD COLUMN kind TEXT NOT NULL DEFAULT 'vn'",
+            "ALTER TABLE orders ADD COLUMN acc_kind TEXT",
+        ):
+            try:
+                con.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
+        con.execute(
+            "UPDATE sll_accs SET kind='vn' WHERE kind IS NULL OR kind=''"
+        )
+        con.execute(
+            "UPDATE packages SET kind='vn' WHERE kind IS NULL OR kind=''"
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_sll_kind_status ON sll_accs(kind, status)")
+        # Backfill 'kind' cho các acc cũ theo đầu số SĐT
+        backfill_rows = con.execute(
+            "SELECT phone FROM sll_accs WHERE kind='vn'"
+        ).fetchall()
         con.close()
+# Backfill ngoài lock dài: tính kind rồi update theo lô
+    for r in backfill_rows:
+        k = detect_kind(r["phone"])
+        if k != "vn":
+            with _DB_LOCK:
+                con = db()
+                con.execute("UPDATE sll_accs SET kind=? WHERE phone=?", (k, r["phone"]))
+                con.close()
+    with _DB_LOCK:
+        con = db()
+        _seed_default_packages(con)
+        con.close()
+
+
+def _seed_default_packages(con: sqlite3.Connection) -> None:
+    """Seed gói mặc định cho cả 2 loại: giá lẻ từng loại × số lượng."""
+    for k in ("vn", "ngoai"):
+        base = BASE_PRICE[k]
+        sizes = PACK_SIZES_VN if k == "vn" else PACK_SIZES_NGOAI
+        for s in sizes:
+            con.execute(
+                "INSERT OR IGNORE INTO packages(size, kind, price) VALUES(?,?,?)",
+                (s, k, base * s),
+            )
 
 
 def get_setting(key: str, default=None):
@@ -299,33 +374,132 @@ def credit_aff(referrer_id: int, amount: float) -> None:
         con.close()
 
 
-def get_packages() -> list:
+def get_packages(kind: str | None = None) -> list:
     with _DB_LOCK:
         con = db()
-        rows = con.execute("SELECT size, price FROM packages ORDER BY size").fetchall()
+        if kind:
+            rows = con.execute(
+                "SELECT size, kind, price FROM packages WHERE kind=? ORDER BY size",
+                (kind,),
+            ).fetchall()
+        else:
+            rows = con.execute("SELECT size, kind, price FROM packages ORDER BY kind, size").fetchall()
         con.close()
-        return [(int(r["size"]), float(r["price"])) for r in rows]
+        return [(int(r["size"]), str(r["kind"]), float(r["price"])) for r in rows]
 
 
-def set_package(size: int, price: float) -> None:
+def get_package_price(size: int, kind: str):
+    with _DB_LOCK:
+        con = db()
+        row = con.execute(
+            "SELECT price FROM packages WHERE size=? AND kind=?", (size, kind)
+        ).fetchone()
+        con.close()
+        return float(row["price"]) if row else None
+
+
+def set_package(size: int, price: float, kind: str = "vn") -> None:
+    kind = norm_kind(kind) or "vn"
     with _DB_LOCK:
         con = db()
         con.execute(
-            "INSERT INTO packages(size, price) VALUES(?,?) "
-            "ON CONFLICT(size) DO UPDATE SET price=excluded.price",
-            (size, price),
+            "INSERT INTO packages(size, kind, price) VALUES(?,?,?) "
+            "ON CONFLICT(size, kind) DO UPDATE SET price=excluded.price",
+            (size, kind, price),
         )
         con.close()
 
 
-def stock_count() -> int:
+def stock_count(kind: str | None = None) -> int:
     with _DB_LOCK:
         con = db()
-        row = con.execute(
-            "SELECT COUNT(*) AS c FROM sll_accs WHERE status='available'"
-        ).fetchone()
+        if kind:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM sll_accs WHERE status='available' AND kind=?",
+                (kind,),
+            ).fetchone()
+        else:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM sll_accs WHERE status='available'"
+            ).fetchone()
         con.close()
         return int(row["c"])
+
+
+KINDS = ("vn", "ngoai")
+KIND_NAME = {"vn": "🇻🇳 Acc Việt", "ngoai": "🌍 Acc Ngoại"}
+# Alias để admin gõ cho nhanh: /addsll vn ... | /addsll ngoai|nn|qt ...
+KIND_ALIAS = {
+    "vn": "vn", "viet": "vn", "vietnam": "vn", "việt": "vn",
+    "ngoai": "ngoai", "ngoại": "ngoai", "nn": "ngoai",
+    "qt": "ngoai", "quocte": "ngoai", "quốc": "ngoai", "us": "ngoai",
+}
+VN_PREFIXES = (
+    "84", "03", "05", "07", "08", "09", "01",
+    "243", "242", "244", "245", "246", "247", "248", "249",
+    "282", "283", "284", "285", "286", "287", "288", "289",
+    "203", "204", "205", "206", "207", "208", "209",
+    "213", "214", "215", "216", "217", "218", "219",
+    "223", "224", "225", "226", "227", "228", "229",
+    "233", "234", "235", "236", "237", "238", "239",
+    "253", "254", "255", "256", "257", "258", "259",
+    "263", "264", "265", "266", "267", "268", "269",
+    "273", "274", "275", "276", "277", "278", "279",
+    "293", "294", "295", "296", "297", "298", "299",
+    "343", "342", "344", "345", "346", "347", "348", "349",
+    "352", "353", "354", "355", "356", "357", "358", "359",
+    "362", "363", "364", "365", "366", "367", "368", "369",
+    "372", "373", "374", "375", "376", "377", "378", "379",
+    "382", "383", "384", "385", "386", "387", "388", "389",
+    "392", "393", "394", "395", "396", "397", "398", "399",
+    "523", "522", "524", "525", "526", "527", "528", "529",
+    "532", "533", "534", "535", "536", "537", "538", "539",
+    "562", "563", "564", "565", "566", "567", "568", "569",
+    "582", "583", "584", "585", "586", "587", "588", "589",
+    "592", "593", "594", "595", "596", "597", "598", "599",
+    "702", "703", "704", "705", "706", "707", "708", "709",
+    "712", "713", "714", "715", "716", "717", "718", "719",
+    "722", "723", "724", "725", "726", "727", "728", "729",
+    "732", "733", "734", "735", "736", "737", "738", "739",
+    "762", "763", "764", "765", "766", "767", "768", "769",
+    "772", "773", "774", "775", "776", "777", "778", "779",
+    "782", "783", "784", "785", "786", "787", "788", "789",
+    "792", "793", "794", "795", "796", "797", "798", "799",
+    "812", "813", "814", "815", "816", "817", "818", "819",
+    "822", "823", "824", "825", "826", "827", "828", "829",
+    "832", "833", "834", "835", "836", "837", "838", "839",
+    "852", "853", "854", "855", "856", "857", "858", "859",
+    "862", "863", "864", "865", "866", "867", "868", "869",
+    "882", "883", "884", "885", "886", "887", "888", "889",
+    "902", "903", "904", "905", "906", "907", "908", "909",
+    "912", "913", "914", "915", "916", "917", "918", "919",
+    "922", "923", "924", "925", "926", "927", "928", "929",
+    "932", "933", "934", "935", "936", "937", "938", "939",
+    "941", "942", "944", "945", "946", "947", "948", "949",
+    "962", "963", "964", "965", "966", "967", "968", "969",
+)
+
+
+def norm_kind(x) -> str | None:
+    if x is None:
+        return None
+    return KIND_ALIAS.get(str(x).strip().lower())
+
+
+def detect_kind(phone: str) -> str:
+    """Tự đoán loại acc từ SĐT: số VN (+84 / 0xxx...) -> 'vn', còn lại -> 'ngoai'."""
+    p = (phone or "").strip().lstrip("+")
+    for pre in VN_PREFIXES:
+        if p.startswith(pre):
+            return "vn"
+    return "ngoai"
+
+
+def kind_of_order(order_row) -> str:
+    k = norm_kind(order_row["kind"] if order_row else None)
+    if k:
+        return k
+    return "vn"
 
 
 def parse_phones(text: str) -> list[str]:
@@ -338,13 +512,15 @@ def parse_phones(text: str) -> list[str]:
     return out
 
 
-def add_sll(phones: list[str]) -> tuple[int, int]:
+def add_sll(phones: list[str], kind: str | None = None) -> tuple[int, int]:
+    """Thêm acc theo loại. Nếu kind=None -> tự đoán từng SĐT (VN/ngoại)."""
     added = dup = 0
     with _DB_LOCK:
         con = db()
         for p in phones:
+            k = kind or detect_kind(p)
             try:
-                con.execute("INSERT INTO sll_accs(phone) VALUES(?)", (p,))
+                con.execute("INSERT INTO sll_accs(phone, kind) VALUES(?,?)", (p, k))
                 added += 1
             except sqlite3.IntegrityError:
                 dup += 1
@@ -419,8 +595,9 @@ def decide_deposit(did: int, admin_id: int, approve: bool):
             con.close()
 
 
-def buy_pack(user_id: int, size: int, price: float, aff_percent: float = 0.0):
-    """Mua gói/acc lẻ: trừ tiền + lock N acc + hoa hồng tiếp thị trong 1 transaction.
+def buy_pack(user_id: int, size: int, price: float, aff_percent: float = 0.0,
+             acc_kind: str = "vn"):
+    """Mua gói/acc lẻ theo loại: trừ tiền + lock N acc + hoa hồng trong 1 transaction.
     Trả (order_id, phones) hoặc (None, 'balance'|'stock')."""
     with _DB_LOCK:
         con = db()
@@ -437,9 +614,9 @@ def buy_pack(user_id: int, size: int, price: float, aff_percent: float = 0.0):
             phones = [
                 r["phone"]
                 for r in con.execute(
-                    "SELECT phone FROM sll_accs WHERE status='available' "
+                    "SELECT phone FROM sll_accs WHERE status='available' AND kind=? "
                     "ORDER BY id LIMIT ?",
-                    (size,),
+                    (acc_kind, size),
                 ).fetchall()
             ]
             if len(phones) < size:
@@ -450,9 +627,9 @@ def buy_pack(user_id: int, size: int, price: float, aff_percent: float = 0.0):
                 (price, user_id),
             )
             cur = con.execute(
-                "INSERT INTO orders(user_id, kind, qty, price, status, phones, created_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (user_id, "PACK" if size > 1 else "SINGLE", size, price, "PAID",
+                "INSERT INTO orders(user_id, kind, acc_kind, qty, price, status, phones, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (user_id, "PACK" if size > 1 else "SINGLE", acc_kind, size, price, "PAID",
                  "\n".join(phones), now_str()),
             )
             order_id = int(cur.lastrowid)
@@ -629,6 +806,8 @@ LBL_PACKS   = "🎟 Mua gói acc"
 LBL_SINGLE  = "📱 Mua acc lẻ"
 LBL_BUY_OK  = "✅ Xác nhận mua"
 LBL_BUY_NO  = "❌ Huỷ mua"
+LBL_KIND_VN = "🇻🇳 Acc Việt"
+LBL_KIND_NGOAI = "🌍 Acc Ngoại"
 
 # Nạp tiền
 LBL_BANK    = "🏦 Ngân hàng (VietQR)"
@@ -684,13 +863,23 @@ def buy_kb() -> ReplyKeyboardMarkup:
     )
 
 
-def packs_kb() -> ReplyKeyboardMarkup:
+def packs_kb(kind: str) -> ReplyKeyboardMarkup:
+    """Bàn phím gói của 1 loại acc."""
     rows = [
-        [KeyboardButton(f"🎟 Gói {size} acc — {vnd(price)}")]
-        for size, price in get_packages()
+        [KeyboardButton(f"🎟 Gói {KIND_NAME[kind]} {size} acc — {vnd(price)}")]
+        for size, kind, price in get_packages(kind)
     ]
     rows.append([KeyboardButton(BTN_BACK)])
     return ReplyKeyboardMarkup(rows, **RP)
+
+
+def kinds_kb() -> ReplyKeyboardMarkup:
+    """Bước 1 khi mua: chọn loại Acc Việt / Acc Ngoại."""
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(LBL_KIND_VN), KeyboardButton(LBL_KIND_NGOAI)],
+         [KeyboardButton(BTN_BACK)]],
+        **RP,
+    )
 
 
 def confirm_buy_kb() -> ReplyKeyboardMarkup:
@@ -753,7 +942,7 @@ def cats_kb() -> ReplyKeyboardMarkup:
 
 
 def clear_state(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for k in ("state", "dep_method", "dep_id", "buy_size", "buy_price"):
+    for k in ("state", "dep_method", "dep_id", "buy_kind", "buy_size", "buy_price"):
         context.user_data.pop(k, None)
 
 
@@ -810,26 +999,33 @@ async def flow_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def flow_cats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    packs = get_packages()
-    min_price = min((p for _, p in packs), default=DEFAULT_PACK_PRICE)
+    lines = []
+    for k in ("vn", "ngoai"):
+        packs = get_packages(k)
+        lines.append(
+            f"{KIND_NAME[k]}\n"
+            f"   • Kho hiện có: <b>{stock_count(k)}</b> acc\n"
+            f"   • Acc lẻ: <b>{vnd(single_price(k))}</b>/acc\n"
+            f"   • Gói: " + (", ".join(f"{s} acc ({vnd(p)})" for s, _, p in packs) or "chưa có") + "\n"
+        )
     await update.effective_message.reply_html(
         "📦 <b>CHUYÊN MỤC SẢN PHẨM</b>\n\n"
-        f"📱 <b>Acc Telegram SLL</b>\n"
-        f"   • Kho hiện có: <b>{stock_count()}</b> acc\n"
-        f"   • Acc lẻ: <b>{vnd(single_price())}</b>/acc\n"
-        f"   • Gói: " + ", ".join(f"{s} acc ({vnd(p)})" for s, p in packs) + "\n\n"
-        "🎁 Sắp ra mắt: Acc khác đang được cập nhật...\n\n"
-        "👇 Chọn nút bên dưới để xem tiếp:",
+        "📱 <b>Acc Telegram SLL</b>\n"
+        + "\n".join(lines)
+        + "\n👇 Chọn nút bên dưới để xem tiếp:",
         reply_markup=cats_kb(),
     )
 
 
-def single_price() -> float:
-    v = get_setting("price_single")
+def single_price(kind: str = "vn") -> float:
+    """Giá acc lẻ riêng từng loại (setting > .env > fallback)."""
+    v = get_setting(f"price_single_{kind}") or get_setting("price_single")
     try:
-        return float(v) if v else DEFAULT_PACK_PRICE
+        if v:
+            return float(v)
     except Exception:
-        return DEFAULT_PACK_PRICE
+        pass
+    return BASE_PRICE.get(kind, DEFAULT_PACK_PRICE)
 
 
 async def flow_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -881,43 +1077,50 @@ async def flow_aff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def flow_buy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_state(context)
-    context.user_data["state"] = "buy_menu"
+    context.user_data["state"] = "buy_kind"
     await update.effective_message.reply_html(
         f"📱 <b>MUA ACC TELEGRAM</b>\n\n"
-        f"📦 Kho hiện có: <b>{stock_count()}</b> acc\n"
-        "🎟 Gói: " + ", ".join(str(s) for s, _ in get_packages()) + " acc\n"
-        f"📱 Acc lẻ: {vnd(single_price())}/acc\n\n"
+        f"{KIND_NAME['vn']}: <b>{stock_count('vn')}</b> acc — từ {vnd(single_price('vn'))}/acc\n"
+        f"{KIND_NAME['ngoai']}: <b>{stock_count('ngoai')}</b> acc — từ {vnd(single_price('ngoai'))}/acc\n\n"
         "🔑 Mua xong lấy mã OTP ngay tại bot này (nút lấy OTP hiện dưới đơn).\n\n"
-        "👇 Bạn muốn mua gói hay mua lẻ?",
-        reply_markup=buy_kb(),
+        "👇 <b>Chọn loại acc muốn mua:</b>",
+        reply_markup=kinds_kb(),
     )
 
 
-async def flow_buy_packs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def flow_buy_packs(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
     context.user_data["state"] = "buy_pack_select"
+    context.user_data["buy_kind"] = kind
+    packs = get_packages(kind)
+    if not packs:
+        await update.effective_message.reply_html(
+            f"😔 {KIND_NAME[kind]} hiện chưa có gói nào.",
+            reply_markup=kinds_kb(),
+        )
+        return
     await update.effective_message.reply_html(
-        "🎟 <b>CHỌN GÓI ACC</b>\n\n👇 Chọn gói muốn mua trên bàn phím:",
-        reply_markup=packs_kb(),
+        f"🎟 <b>CHỌN GÓI {KIND_NAME[kind].upper()}</b>\n\n👇 Chọn gói muốn mua trên bàn phím:",
+        reply_markup=packs_kb(kind),
     )
 
 
-async def flow_buy_pack_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, size: int):
-    packs = dict(get_packages())
-    price = packs.get(size)
+async def flow_buy_pack_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, size: int, kind: str):
+    price = get_package_price(size, kind)
     if price is None:
         await update.effective_message.reply_text("❌ Gói không tồn tại.")
         return
     uid = update.effective_user.id
     bal = get_balance(uid)
     context.user_data["state"] = "buy_confirm"
+    context.user_data["buy_kind"] = kind
     context.user_data["buy_size"] = size
     context.user_data["buy_price"] = price
-    ok = bal >= price and stock_count() >= size
+    ok = bal >= price and stock_count(kind) >= size
     txt = (
-        f"🧾 <b>ĐƠN MUA — GÓI {size} ACC</b>\n\n"
+        f"🧾 <b>ĐƠN MUA — GÓI {size} {KIND_NAME[kind].upper()}</b>\n\n"
         f"💸 Giá: <b>{vnd(price)}</b>\n"
         f"💰 Số dư: {vnd(bal)}\n"
-        f"📦 Kho: {stock_count()} acc\n\n"
+        f"📦 Kho {KIND_NAME[kind]}: {stock_count(kind)} acc\n\n"
     )
     if not ok:
         context.user_data["state"] = "buy_menu"
@@ -936,18 +1139,19 @@ async def flow_buy_pack_detail(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.effective_message.reply_html(txt, reply_markup=confirm_buy_kb())
 
 
-async def flow_buy_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def flow_buy_single(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
     uid = update.effective_user.id
-    price = single_price()
+    price = single_price(kind)
     bal = get_balance(uid)
     context.user_data["state"] = "buy_confirm"
+    context.user_data["buy_kind"] = kind
     context.user_data["buy_size"] = 1
     context.user_data["buy_price"] = price
     txt = (
-        f"🧾 <b>ĐƠN MUA — 1 ACC LẺ</b>\n\n"
+        f"🧾 <b>ĐƠN MUA — 1 {KIND_NAME[kind].upper()} LẺ</b>\n\n"
         f"💸 Giá: <b>{vnd(price)}</b>/acc\n"
         f"💰 Số dư: {vnd(bal)}\n"
-        f"📦 Kho: {stock_count()} acc\n\n"
+        f"📦 Kho {KIND_NAME[kind]}: {stock_count(kind)} acc\n\n"
     )
     if bal < price:
         context.user_data["state"] = "buy_menu"
@@ -958,7 +1162,7 @@ async def flow_buy_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
         return
-    if stock_count() < 1:
+    if stock_count(kind) < 1:
         context.user_data["state"] = "buy_menu"
         await update.effective_message.reply_html(
             txt + "❌ Kho hết acc — liên hệ @" + ADMIN_USERNAME + ".",
@@ -972,6 +1176,7 @@ async def flow_buy_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def flow_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    kind = norm_kind(context.user_data.get("buy_kind")) or "vn"
     size = int(context.user_data.get("buy_size") or 0)
     price = float(context.user_data.get("buy_price") or 0)
     if not size or price <= 0:
@@ -986,7 +1191,7 @@ async def flow_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             percent = float(v)
         except Exception:
             pass
-    order_id, result = buy_pack(uid, size, price, percent)
+    order_id, result = buy_pack(uid, size, price, percent, acc_kind=kind)
     if order_id is None:
         context.user_data["state"] = "buy_menu"
         if result == "balance":
@@ -1007,7 +1212,7 @@ async def flow_buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     listing = "\n".join(f"{i}. <code>{h(p)}</code>" for i, p in enumerate(phones, 1))
     txt = (
         f"✅ <b>MUA THÀNH CÔNG</b>\n\n"
-        f"🧾 Đơn: <b>#{order_id}</b> — {size} acc\n"
+        f"🧾 Đơn: <b>#{order_id}</b> — {size} {KIND_NAME[kind]}\n"
         f"💸 Đã trừ: {vnd(price)}\n"
         f"💰 Số dư còn lại: {vnd(get_balance(uid))}\n\n"
         f"📞 <b>DANH SÁCH ACC:</b>\n{listing}\n\n"
@@ -1518,16 +1723,18 @@ async def flow_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_html(
         "🛠 <b>ADMIN PANEL</b>\n\n"
-        f"📦 Kho acc: {stock_count()}\n\n"
+        f"📦 Kho acc: {stock_count('vn')} Việt / {stock_count('ngoai')} Ngoại\n\n"
         "📋 <b>Lệnh nhanh:</b>\n"
-        "• <code>/addsll</code> — thêm SĐT (xuống dòng/cách/phẩy)\n"
+        "• <code>/addsll [vn|ngoai] &lt;sdt...&gt;</code> — nhập acc (tự đoán nếu thiếu loại)\n"
         "• <code>/delsll &lt;sdt&gt;</code> — xoá acc\n"
         "• <code>/duyet &lt;id&gt;</code> / <code>/tuchoi &lt;id&gt;</code> — duyệt nạp\n"
         "• <code>/otplist</code> — YC OTP đang chờ (hoặc nút 🔑 OTP chờ gửi)\n"
         "• <code>/guiotp &lt;id&gt; &lt;ma&gt;</code> — gửi OTP cho khách\n"
         "   (hoặc chỉ cần <b>reply</b> tin nhắn YC OTP bằng mã OTP)\n"
-        "• <code>/setpack &lt;size&gt; &lt;giá&gt;</code> — giá gói\n"
-        "• <code>/setprice &lt;giá&gt;</code> — giá acc lẻ\n"
+        "• <code>/addsll [vn|ngoai] &lt;sdt...&gt;</code> — nhập acc (tự đoán nếu thiếu loại)\n"
+        "• <code>/stock [vn|ngoai]</code> — xem kho từng loại\n"
+        "• <code>/setpack &lt;vn|ngoai&gt; &lt;size&gt; &lt;giá&gt;</code> — giá gói từng loại\n"
+        "• <code>/setprice &lt;vn|ngoai&gt; &lt;giá&gt;</code> — giá acc lẻ từng loại\n"
         "• <code>/setrate &lt;usdt|ton&gt; &lt;vnd&gt;</code> — tỉ giá\n"
         "• <code>/setaff &lt;%&gt;</code> — % hoa hồng tiếp thị\n"
         "• <code>/addbal &lt;uid&gt; &lt;tiền&gt;</code> — cộng tiền user",
@@ -1537,7 +1744,9 @@ async def flow_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def flow_admin_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_html(
-        f"📦 <b>Kho acc khả dụng:</b> {stock_count()}", reply_markup=admin_kb()
+        f"📦 <b>Kho acc khả dụng:</b> <b>{stock_count('vn')}</b> Việt / "
+        f"<b>{stock_count('ngoai')}</b> Ngoại",
+        reply_markup=admin_kb(),
     )
 
 
@@ -1590,24 +1799,46 @@ def admin_only(func):
 
 @admin_only
 async def cmd_addsll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Thêm SĐT: xuống dòng / cách / phẩy đều được; hoặc reply tin nhắn chứa danh sách."""
+    """Thêm SĐT theo loại: /addsll [vn|ngoai] <sdt...>.
+
+    - /addsll vn 0912... 0987...      -> ép toàn bộ là Acc Việt
+    - /addsll ngoai 1415... 4477...   -> ép toàn bộ là Acc Ngoại (alias: nn, qt)
+    - /addsll 0912... 1415...         -> tự đoán từng SĐT (VN/ngoại)
+    SĐT: xuống dòng / cách / phẩy đều được; hoặc reply tin nhắn chứa danh sách.
+    """
     msg = update.effective_message
-    text = " ".join(context.args) if context.args else ""
+    args = list(context.args or [])
+    kind = norm_kind(args[0]) if args else None
+    if kind and len(args) > 1:
+        args = args[1:]   # bỏ token loại ở đầu
+    elif kind and len(args) == 1:
+        args = []
+    text = " ".join(args)
     if not text and msg.reply_to_message:
         text = msg.reply_to_message.text or ""
     phones = parse_phones(text)
     if not phones:
         await msg.reply_html(
             "📝 <b>Cách dùng /addsll:</b>\n"
-            "<code>/addsll 0912345678 0987654321</code>\n"
-            "hoặc mỗi SĐT 1 dòng:\n<code>/addsll 0912345678\n0987654321</code>\n"
+            "<code>/addsll vn 0912345678 0987654321</code> — ép Acc Việt\n"
+            "<code>/addsll ngoai 14155551234 4477009001</code> — ép Acc Ngoại\n"
+            "<code>/addsll 0912345678 14155551234</code> — tự đoán từng SĐT\n"
+            "SĐT cách nhau bằng dấu cách, xuống dòng hoặc phẩy;\n"
             "hoặc reply tin nhắn chứa danh sách SĐT bằng /addsll"
         )
         return
-    added, dup = add_sll(phones)
+    added, dup = add_sll(phones, kind)
+    if kind:
+        c_vn = sum(1 for p in phones if detect_kind(p) == "vn")
+        c_nn = len(phones) - c_vn
+        detail = f" ({KIND_NAME[kind]})"
+    else:
+        c_vn = sum(1 for p in phones if detect_kind(p) == "vn")
+        c_nn = len(phones) - c_vn
+        detail = f" (tự đoán: {c_vn} Việt / {c_nn} Ngoại)"
     await msg.reply_html(
-        f"✅ <b>Đã thêm {added} acc SLL</b>" + (f" (bỏ qua {dup} trùng)" if dup else "")
-        + f"\n📦 Kho hiện tại: <b>{stock_count()}</b> acc"
+        f"✅ <b>Đã thêm {added} acc SLL</b>{detail}" + (f" (bỏ qua {dup} trùng)" if dup else "")
+        + f"\n📦 Kho hiện tại: <b>{stock_count('vn')}</b> Việt / <b>{stock_count('ngoai')}</b> Ngoại"
     )
 
 
@@ -1624,7 +1855,17 @@ async def cmd_delsll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_html(f"📦 Kho acc khả dụng: <b>{stock_count()}</b>")
+    k = norm_kind(context.args[0]) if context.args else None
+    if k:
+        await update.effective_message.reply_html(
+            f"📦 Kho <b>{KIND_NAME[k]}</b> khả dụng: <b>{stock_count(k)}</b>"
+        )
+    else:
+        await update.effective_message.reply_html(
+            f"📦 Kho khả dụng: <b>{stock_count('vn')}</b> Việt / "
+            f"<b>{stock_count('ngoai')}</b> Ngoại\n"
+            "Xem riêng: <code>/stock vn</code> hoặc <code>/stock ngoai</code>"
+        )
 
 
 @admin_only
@@ -1678,30 +1919,56 @@ async def cmd_tuchoi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_setpack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 2 or not context.args[0].isdigit():
-        await update.effective_message.reply_text("Dùng: /setpack <size> <gia_vnd> (vd: /setpack 10 400000)")
+    """/setpack <vn|ngoai> <size> <gia_vnd> — giá gói riêng từng loại.
+    vd: /setpack vn 10 400000 | /setpack ngoai 10 700000
+    (Tương thích cũ: /setpack <size> <gia> -> mặc định Acc Việt)"""
+    if len(context.args) == 3 and norm_kind(context.args[0]):
+        kind = norm_kind(context.args[0])
+        size_s, price_s = context.args[1], context.args[2]
+    elif len(context.args) == 2 and context.args[0].isdigit():
+        kind, size_s, price_s = "vn", context.args[0], context.args[1]
+    else:
+        await update.effective_message.reply_text(
+            "Dùng: /setpack <vn|ngoai> <size> <gia_vnd>\n"
+            "vd: /setpack vn 10 400000 | /setpack ngoai 10 700000"
+        )
         return
-    price = _parse_amount("bank", context.args[1])
+    if not size_s.isdigit():
+        await update.effective_message.reply_text("❌ Size không hợp lệ.")
+        return
+    price = _parse_amount("bank", price_s)
     if price is None or price <= 0:
         await update.effective_message.reply_text("❌ Giá không hợp lệ.")
         return
-    set_package(int(context.args[0]), price)
+    set_package(int(size_s), price, kind)
     await update.effective_message.reply_html(
-        f"✅ Đã đặt gói <b>{context.args[0]} acc = {vnd(price)}</b>"
+        f"✅ Đã đặt gói <b>{size_s} {KIND_NAME[kind]} = {vnd(price)}</b>"
     )
 
 
 @admin_only
 async def cmd_setprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text("Dùng: /setprice <gia_1_acc>")
+    """/setprice <vn|ngoai> <gia_1_acc> — giá acc lẻ riêng từng loại.
+    vd: /setprice vn 50000 | /setprice ngoai 80000
+    (Tương thích cũ: /setprice <gia> -> mặc định Acc Việt)"""
+    if len(context.args) == 2 and norm_kind(context.args[0]):
+        kind, price_s = norm_kind(context.args[0]), context.args[1]
+    elif len(context.args) == 1:
+        kind, price_s = "vn", context.args[0]
+    else:
+        await update.effective_message.reply_text(
+            "Dùng: /setprice <vn|ngoai> <gia_1_acc>\n"
+            "vd: /setprice vn 50000 | /setprice ngoai 80000"
+        )
         return
-    price = _parse_amount("bank", context.args[0])
+    price = _parse_amount("bank", price_s)
     if price is None or price <= 0:
         await update.effective_message.reply_text("❌ Giá không hợp lệ.")
         return
-    set_setting("price_single", price)
-    await update.effective_message.reply_html(f"✅ Giá acc lẻ: <b>{vnd(price)}</b>/acc")
+    set_setting(f"price_single_{kind}", price)
+    await update.effective_message.reply_html(
+        f"✅ Giá acc lẻ <b>{KIND_NAME[kind]}: {vnd(price)}</b>/acc"
+    )
 
 
 @admin_only
@@ -1894,21 +2161,46 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = context.user_data.get("state")
 
-    # ── 2) Luồng MUA ACC ──
+    # ── 2) Luồng MUA ACC: chọn loại -> chọn gói/lẻ -> xác nhận ──
+    if state == "buy_kind":
+        if text == LBL_KIND_VN:
+            context.user_data["buy_kind"] = "vn"
+            await msg.reply_html(
+                f"✅ Đã chọn <b>{KIND_NAME['vn']}</b> — kho: <b>{stock_count('vn')}</b> acc.\n"
+                "👇 Bạn muốn mua gói hay mua lẻ?",
+                reply_markup=buy_kb(),
+            )
+            context.user_data["state"] = "buy_menu"
+            return
+        if text == LBL_KIND_NGOAI:
+            context.user_data["buy_kind"] = "ngoai"
+            await msg.reply_html(
+                f"✅ Đã chọn <b>{KIND_NAME['ngoai']}</b> — kho: <b>{stock_count('ngoai')}</b> acc.\n"
+                "👇 Bạn muốn mua gói hay mua lẻ?",
+                reply_markup=buy_kb(),
+            )
+            context.user_data["state"] = "buy_menu"
+            return
+        await msg.reply_html("👇 Chọn loại acc trên bàn phím nhé:")
+        return
+
     if state == "buy_menu":
+        kind = norm_kind(context.user_data.get("buy_kind")) or "vn"
+        context.user_data["buy_kind"] = kind
         if text == LBL_PACKS:
-            await flow_buy_packs(update, context)
+            await flow_buy_packs(update, context, kind)
             return
         if text == LBL_SINGLE:
-            await flow_buy_single(update, context)
+            await flow_buy_single(update, context, kind)
             return
         await msg.reply_html("👇 Chọn <b>🎟 Mua gói acc</b> hoặc <b>📱 Mua acc lẻ</b>:")
         return
 
     if state == "buy_pack_select":
-        m = re.fullmatch(r"🎟 Gói (\d+) acc — ([\d.,]+)đ", text)
+        kind = norm_kind(context.user_data.get("buy_kind")) or "vn"
+        m = re.fullmatch(r"🎟 Gói (.+?) (\d+) acc — ([\d.,]+)đ", text)
         if m:
-            await flow_buy_pack_detail(update, context, int(m.group(1)))
+            await flow_buy_pack_detail(update, context, int(m.group(2)), kind)
             return
         await msg.reply_html("👇 Chọn gói trên bàn phím nhé:")
         return
